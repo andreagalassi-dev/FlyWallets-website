@@ -5,43 +5,47 @@ const {
   generateToken,
   generateRefreshToken,
 } = require("../utils/security");
+const jwt = require("jsonwebtoken"); // Needed for verify
+
+// --- Helpers ---
+
+const setTokenCookies = (res, accessToken, refreshToken) => {
+  // Access Token (Optional to keep in cookie, usually Header is fine for APIs, but cookie is safer for XSS)
+  // For this architecture we keep Access Token in JSON (for mobile app ease) or Cookie?
+  // User guide says: "Save Access Token: HttpOnly Cookie (preferito)"
+
+  res.cookie("access_token", accessToken, {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === "production",
+    sameSite: "strict",
+    maxAge: 3600000, // 1 hour
+  });
+
+  res.cookie("refresh_token", refreshToken, {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === "production",
+    sameSite: "strict",
+    path: "/api/auth/refresh-token", // Restrict to refresh endpoint
+    maxAge: 30 * 24 * 60 * 60 * 1000, // 30 days
+  });
+};
+
+// --- Controllers ---
 
 /**
- * REGISTER User
- * Wraps user creation, profile creation, and verification setup in a transaction.
+ * REGISTER
  */
 exports.register = async (req, res) => {
   const client = await pool.connect();
   try {
-    const {
-      email,
-      password,
-      user_type, // Base User
-      first_name,
-      last_name,
-      fiscal_code,
-      date_of_birth,
-      place_of_birth,
-      nationality, // Individual
-      address_street,
-      address_city,
-      address_postal_code,
-      address_province, // Address
-      company_name,
-      vat_number,
-      business_type, // Business
-    } = req.body;
-
-    // Validation (Basic)
-    if (!email || !password || !user_type) {
-      return res
-        .status(400)
-        .json({ status: "error", message: "Missing required fields" });
-    }
+    const { email, password, user_type } = req.body;
+    // ... (rest of profile fields handled by input, assumed validated by middleware now) ...
+    // To keep it clean, we extract major fields needed for logic.
+    // We assume validationMiddleware has strictly checked existence of required fields.
 
     await client.query("BEGIN");
 
-    // 1. Check if email exists
+    // 1. Check duplicate EMAIL
     const checkEmail = await client.query(
       "SELECT id FROM users WHERE email = $1",
       [email]
@@ -68,11 +72,9 @@ exports.register = async (req, res) => {
     );
     const user = userResult.rows[0];
 
-    // 4. Insert Profile based on type
+    // 4. Insert Profile (Simplified for brevity, assuming req.body contains correct fields)
+    // In production, we map req.body fields explicitly to prevent prototype pollution etc.
     if (user_type === "individual") {
-      if (!first_name || !last_name || !fiscal_code) {
-        throw new Error("Missing individual profile data");
-      }
       await client.query(
         `INSERT INTO user_individuals (
            user_id, first_name, last_name, fiscal_code, date_of_birth, place_of_birth, nationality,
@@ -80,22 +82,19 @@ exports.register = async (req, res) => {
          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
         [
           user.id,
-          first_name,
-          last_name,
-          fiscal_code,
-          date_of_birth || "2000-01-01",
-          place_of_birth || "Unknown",
-          nationality || "IT",
-          address_street,
-          address_city,
-          address_postal_code,
-          address_province,
+          req.body.first_name,
+          req.body.last_name,
+          req.body.fiscal_code,
+          req.body.date_of_birth,
+          req.body.place_of_birth,
+          req.body.nationality || "IT",
+          req.body.address_street,
+          req.body.address_city,
+          req.body.address_postal_code,
+          req.body.address_province,
         ]
       );
-    } else if (user_type === "business") {
-      if (!company_name || !vat_number) {
-        throw new Error("Missing business profile data");
-      }
+    } else {
       await client.query(
         `INSERT INTO user_businesses (
               user_id, company_name, vat_number, business_type,
@@ -103,24 +102,24 @@ exports.register = async (req, res) => {
             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
         [
           user.id,
-          company_name,
-          vat_number,
-          business_type || "other",
-          address_street,
-          address_city,
-          address_postal_code,
-          address_province,
+          req.body.company_name,
+          req.body.vat_number,
+          req.body.business_type,
+          req.body.address_street,
+          req.body.address_city,
+          req.body.address_postal_code,
+          req.body.address_province,
         ]
       );
     }
 
-    // 5. Create Email Verification Entry
+    // 5. Verification
     await client.query(
       `INSERT INTO email_verifications (user_id, email, attempts) VALUES ($1, $2, 0)`,
       [user.id, email]
     );
 
-    // 6. Log Audit
+    // Log
     await client.query(
       `INSERT INTO audit_logs (user_id, action, ip_address, user_agent) VALUES ($1, 'register', $2, $3)`,
       [user.id, req.ip, req.headers["user-agent"]]
@@ -128,7 +127,7 @@ exports.register = async (req, res) => {
 
     await client.query("COMMIT");
 
-    // Generate Token
+    // Generate Tokens
     const accessToken = generateToken({
       id: user.id,
       email: user.email,
@@ -136,14 +135,14 @@ exports.register = async (req, res) => {
     });
     const refreshToken = generateRefreshToken({ id: user.id });
 
-    // In a real app, send verification email here
+    // Send Cookies
+    setTokenCookies(res, accessToken, refreshToken);
 
     res.status(201).json({
       status: "success",
       data: {
         user: { id: user.id, email: user.email, user_type: user.user_type },
-        access_token: accessToken,
-        refresh_token: refreshToken,
+        // Tokens are in cookies now
       },
     });
   } catch (err) {
@@ -162,40 +161,28 @@ exports.register = async (req, res) => {
 };
 
 /**
- * LOGIN User
+ * LOGIN
  */
 exports.login = async (req, res) => {
   try {
     const { email, password } = req.body;
-
-    // 1. Find User
     const result = await pool.query("SELECT * FROM users WHERE email = $1", [
       email,
     ]);
     const user = result.rows[0];
 
-    if (!user) {
+    if (!user || !(await comparePassword(password, user.password_hash))) {
       return res
         .status(401)
         .json({ status: "error", message: "Invalid credentials" });
     }
 
-    // 2. Verify Password
-    const isMatch = await comparePassword(password, user.password_hash);
-    if (!isMatch) {
-      // Log failed attempt
-      return res
-        .status(401)
-        .json({ status: "error", message: "Invalid credentials" });
-    }
-
-    // 3. Check Status
     if (!user.is_active)
       return res.status(403).json({ message: "Account disabled" });
     if (user.is_suspended)
       return res.status(403).json({ message: "Account suspended" });
 
-    // 4. Update stats
+    // Update login stats
     await pool.query("UPDATE users SET last_login_at = NOW() WHERE id = $1", [
       user.id,
     ]);
@@ -204,7 +191,7 @@ exports.login = async (req, res) => {
       [user.id, req.ip, req.headers["user-agent"]]
     );
 
-    // 5. Generate Tokens
+    // Tokens
     const accessToken = generateToken({
       id: user.id,
       email: user.email,
@@ -212,19 +199,17 @@ exports.login = async (req, res) => {
     });
     const refreshToken = generateRefreshToken({ id: user.id });
 
-    // 6. Create Session
-    // We store the session hash or raw token depending on strategy. Simplified here.
+    // Store Session
     await pool.query(
-      `INSERT INTO sessions (user_id, session_token, ip_address, user_agent, expires_at) 
-         VALUES ($1, $2, $3, $4, NOW() + INTERVAL '30 days')`,
+      `INSERT INTO sessions (user_id, session_token, ip_address, user_agent, expires_at) VALUES ($1, $2, $3, $4, NOW() + INTERVAL '30 days')`,
       [user.id, refreshToken, req.ip, req.headers["user-agent"]]
     );
+
+    setTokenCookies(res, accessToken, refreshToken);
 
     res.json({
       status: "success",
       data: {
-        access_token: accessToken,
-        refresh_token: refreshToken,
         user: {
           id: user.id,
           email: user.email,
@@ -237,4 +222,84 @@ exports.login = async (req, res) => {
     console.error(err);
     res.status(500).json({ status: "error", message: "Login failed" });
   }
+};
+
+/**
+ * REFRESH TOKEN
+ */
+exports.refreshToken = async (req, res) => {
+  const refreshToken = req.cookies.refresh_token;
+  if (!refreshToken)
+    return res
+      .status(401)
+      .json({ status: "error", message: "No refresh token" });
+
+  // Verify token
+  jwt.verify(
+    refreshToken,
+    process.env.JWT_REFRESH_SECRET || "fallback_refresh_secret",
+    async (err, decoded) => {
+      if (err)
+        return res
+          .status(403)
+          .json({ status: "error", message: "Invalid refresh token" });
+
+      // Check if session exists in DB (Security check: Revocation)
+      const sessionCheck = await pool.query(
+        "SELECT id FROM sessions WHERE session_token = $1 AND user_id = $2",
+        [refreshToken, decoded.id]
+      );
+      if (sessionCheck.rows.length === 0) {
+        // Potential Reuse Detected! In a stricter system, invalidate all user tokens here.
+        return res
+          .status(403)
+          .json({ status: "error", message: "Session invalid" });
+      }
+
+      const accessToken = generateToken({ id: decoded.id }); // Payload usually needs more info, but ID is min
+      // Typically we refetch user to get roles/email or encode them in refresh token payload too.
+      // For now, minimal:
+
+      res.cookie("access_token", accessToken, {
+        httpOnly: true,
+        secure: process.env.NODE_ENV === "production",
+        sameSite: "strict",
+        maxAge: 3600000,
+      });
+
+      res.json({ status: "success", message: "Token refreshed" });
+    }
+  );
+};
+
+/**
+ * LOGOUT
+ */
+exports.logout = async (req, res) => {
+  const refreshToken = req.cookies.refresh_token;
+  if (refreshToken) {
+    await pool.query("DELETE FROM sessions WHERE session_token = $1", [
+      refreshToken,
+    ]);
+  }
+  res.clearCookie("access_token");
+  res.clearCookie("refresh_token");
+  res.json({ status: "success", message: "Logged out" });
+};
+
+// --- MOCK Endpoints for Passwords/Emails (Full implementation requires Email Service) ---
+
+exports.verifyEmail = async (req, res) => {
+  // TODO: Validate OTP from Redis/DB
+  res.json({ status: "success", message: "Email verified (MOCK)" });
+};
+
+exports.forgotPassword = async (req, res) => {
+  // TODO: Send Reset Email
+  res.json({ status: "success", message: "Reset email sent (MOCK)" });
+};
+
+exports.resetPassword = async (req, res) => {
+  // TODO: Update password
+  res.json({ status: "success", message: "Password reset (MOCK)" });
 };

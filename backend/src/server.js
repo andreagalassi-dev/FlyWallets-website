@@ -18,6 +18,8 @@ app.use(morgan("dev"));
 connectDB();
 
 // Routes
+app.use("/api/auth", require("./routes/authRoutes"));
+
 app.get("/api/health", (req, res) => {
   res
     .status(200)
@@ -36,6 +38,6 @@ app.use((err, req, res, next) => {
 
 // Server Start
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => {
+app.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Server running on port ${PORT}`);
 });

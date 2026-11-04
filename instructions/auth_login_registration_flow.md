@@ -13,11 +13,52 @@ Questo documento descrive il flusso di **Registrazione** e **Login** per l'appli
 ✅ **Password Hash**: Password mai in chiaro, sempre hashate con bcrypt  
 ✅ **Session Management**: Token JWT con scadenza e refresh automatico  
 
+> **Nota sullo stato del documento.** Questo file nasce come specifica di progetto (flusso a 6 step, OTP in Redis, SMS, ecc.).
+> L'implementazione attuale (backend `backend/src/controllers/authController.js`, frontend `frontend/src/app/*`) è più semplice
+> e in alcuni punti diversa. Le sezioni sotto restano come specifica di riferimento; in ogni sezione i blocchi
+> **"Stato implementazione"** indicano cosa fa davvero il codice. Legenda: ✅ implementato, ⚠️ implementato in modo diverso,
+> ❌ non implementato (solo pianificato).
+
+## 1bis. STATO DI IMPLEMENTAZIONE (riepilogo aggiornato al codice)
+
+| Tema | Specifica (questo documento) | Codice attuale | Stato |
+|------|------------------------------|----------------|-------|
+| Registrazione | 6 step, endpoint `register-step1`, `register-step3-*`, `register-finalize` | Un solo form (`/register`, scelta Privato/Azienda) e **una** chiamata `POST /api/auth/register`: crea `users` + `user_individuals`/`user_businesses` + OTP + sessione in un'unica transazione SQL e imposta i cookie | ⚠️ |
+| Login | Blocca se email non verificata; ritorna i token nel JSON | `POST /api/auth/login`: **non** richiede email verificata; i token viaggiano solo nei cookie HttpOnly (il JSON contiene solo l'utente) | ⚠️ |
+| Access token | 1 ora | **15 minuti** (`ACCESS_TTL`), cookie `access_token` | ⚠️ |
+| Refresh token | 30 giorni, restituisce nuovo access token | 30 giorni, cookie `refresh_token`. **Rotazione a ogni refresh** con rilevamento del riuso (vedi 6.3) | ✅ (esteso) |
+| Tabella `sessions` | `session_token` = hash dell'access JWT | `session_token` = **SHA-256 del refresh token**; colonna `rotated_at` per la rotazione | ⚠️ |
+| OTP email | Generato in memoria/Redis, **non** salvato nel DB | Salvato **hashato** in `email_verifications.code_hash` (HMAC-SHA256 con `JWT_SECRET`, legato all'utente). Nessun Redis | ⚠️ |
+| Endpoint verifica email | `send-otp-email`, `verify-email-otp {email, otp}` | `POST /api/auth/verify-email {code}` e `POST /api/auth/resend-verification` (entrambi autenticati: l'utente è già loggato dopo la registrazione) | ⚠️ |
+| Lockout OTP | 3 tentativi, blocco 15 min | ✅ 3 tentativi (`max_attempts`), `locked_until` +15 min; il tentativo viene riservato in modo atomico in SQL prima del confronto | ✅ |
+| Verifica telefono / SMS | Step 5 con OTP SMS | ❌ **Non implementato.** `smsService.js` (Twilio) esiste ma nessun endpoint lo chiama; la tabella `phone_verifications` e `users.phone_verified` non sono usate. Il numero di telefono viene solo salvato | ❌ |
+| Reset password | `forgot` + `GET validate-reset-token` + `reset` + email di conferma | `POST /api/auth/forgot-password` (risponde sempre 200) e `POST /api/auth/reset-password`. **Non esiste** `validate-reset-token` e **non** viene inviata l'email "password cambiata" | ⚠️ |
+| Rate limiting | login 5/15min, register 3/h, reset 3/h, OTP 3 tentativi | login: 5 tentativi **falliti**/15 min/IP; register 3/h/IP; richieste OTP/reset 3/10 min per utente o per email normalizzata; verify/forgot/reset 20/10 min/IP; API autenticata 120/min/utente; AI 10/min/utente. Contatori in memoria di processo | ✅ (valori diversi) |
+| Lockout account dopo login falliti | "Lockout 30 min dopo >5 falliti" | ❌ Solo rate limit per IP, nessun lockout per account | ❌ |
+| CSRF | SameSite + token CSRF + verifica Origin | Solo `SameSite=Strict` (+ CORS con allow-list). **Nessun token CSRF** | ⚠️ |
+| Verifica email obbligatoria | Account attivo solo dopo verifica | Opzionale: `REQUIRE_VERIFIED_EMAIL=true` blocca le **scritture** (403 `EMAIL_NOT_VERIFIED`); letture e auth restano aperte | ⚠️ |
+| Termini / Privacy / Marketing | Checkbox nel form | Il backend imposta `terms_accepted` e `privacy_accepted` a `true` in automatico; il form **non** ha checkbox e `marketing_consent` non viene mai impostato | ⚠️ |
+| Password policy | 8+, maiuscola, minuscola, numero, speciale, no password comuni | Backend: 8+, 1 maiuscola, 1 numero, 1 carattere in `@$!%*?&`. Nessun controllo su minuscole né su liste di password comuni. Il frontend mostra un misuratore di robustezza (`PasswordStrength`) | ⚠️ |
+| 2FA, device management, email "nuovo login" | Previsti | ❌ Non implementati (colonne `two_factor_*` inutilizzate; le sessioni sono salvate ma nessun endpoint le elenca) | ❌ |
+| Audit log | Tutte le azioni di auth | Scritti: `register`, `login`, `forgot_password`, `reset_password`, `verify_email`, `refresh_token_reuse` (e `import_transactions` per il CSV). Non loggati: logout, reinvio OTP, login falliti | ⚠️ |
+
+Mappa dei file: `backend/src/routes/authRoutes.js`, `backend/src/controllers/authController.js`,
+`backend/src/utils/security.js` (bcrypt, JWT, SHA-256, OTP/HMAC), `backend/src/middleware/{authMiddleware,rateLimitMiddleware,validationMiddleware}.js`,
+`backend/src/services/emailService.js`; frontend: `frontend/src/app/{login,register,register/verify-email,forgot-password,reset-password}/page.js`,
+`frontend/src/lib/api.js` (refresh automatico), `frontend/src/proxy.js` (redirect guest/utente).
+
+
 ---
 
 ## 2. FLUSSO DI REGISTRAZIONE
 
 ### 2.1 Step 1 - Frontend: Form Registrazione Iniziale
+
+> **Stato implementazione:** ⚠️ non esiste `POST /api/auth/register-step1` né una pagina per ogni step. `/register` è un unico form
+> (email, password + conferma, tipo account, dati anagrafici/aziendali, indirizzo, telefono) che invia **una sola** `POST /api/auth/register`.
+> Il backend controlla l'unicità dell'email (409 se già registrata), calcola l'hash bcrypt (12 round), salva utente e profilo, genera l'OTP,
+> crea la sessione, imposta i cookie e risponde 201 con `requiresEmailVerification: true`. Non ci sono checkbox Termini/Privacy/Marketing.
+
 
 **Pagina**: `/register` o `/signup`
 
@@ -70,6 +111,13 @@ Questo documento descrive il flusso di **Registrazione** e **Login** per l'appli
 
 ### 2.3 Step 3A - Frontend: Dati Personali (Privato)
 
+> **Stato implementazione:** ⚠️ i dati vanno nella stessa `POST /api/auth/register` (nessun `register-step3-individual`). Il backend
+> valida come obbligatori `first_name`, `last_name`, `fiscal_code`, `date_of_birth`, `place_of_birth` e l'indirizzo (`address_street`, `address_city`,
+> `address_postal_code`, `address_province`). Il formato del codice fiscale **non** è verificato dal backend (solo "non vuoto"); il vincolo di età
+> (>= 18 anni) non è implementato. `address_country` viene inviato dal form ma il backend non lo salva in fase di registrazione
+> (è modificabile da `PUT /api/auth/profile`).
+
+
 **Pagina**: `/register/personal-data`
 
 **Campi da Compilare (vanno in `user_individuals`)**:
@@ -108,6 +156,11 @@ Questo documento descrive il flusso di **Registrazione** e **Login** per l'appli
 
 ### 2.3B - Frontend: Dati Azienda (Business)
 
+> **Stato implementazione:** ⚠️ stessa `POST /api/auth/register` con `user_type: "business"`. Obbligatori: `company_name`, `vat_number`,
+> `owner_first_name`, `owner_last_name`, `owner_fiscal_code`, `phone_number`. `business_type` ha default `srl` (il form non lo chiede).
+> Nessuna validazione del formato della Partita IVA lato backend.
+
+
 **Pagina**: `/register/business-data`
 
 **Campi da Compilare (vanno in `user_businesses`)**:
@@ -135,6 +188,17 @@ Questo documento descrive il flusso di **Registrazione** e **Login** per l'appli
 ---
 
 ### 2.4 Step 4 - Frontend: Verifica Email
+
+> **Stato implementazione:** ⚠️ la pagina `/register/verify-email` (6 input da una cifra, countdown di 60 s per il reinvio, gestione del blocco di 15 min)
+> viene aperta subito dopo la registrazione, con l'utente già autenticato dai cookie. Gli endpoint reali sono:
+> - `POST /api/auth/verify-email` con `{ "code": "123456" }` (non `{email, otp}`: l'utente è quello del token);
+> - `POST /api/auth/resend-verification` (nuovo codice; sostituisce quelli pendenti; max 3 richieste ogni 10 minuti per utente; rifiutato se la verifica è bloccata).
+>
+> L'OTP **non** è in Redis: è nella tabella `email_verifications` solo come HMAC (`code_hash`), con `expires_at` = +10 minuti, `attempts`/`max_attempts` (3) e
+> `locked_until` (+15 minuti). Se la verifica va a buon fine: `email_verifications.is_verified = true`, `users.email_verified = true` e audit `verify_email`.
+> Risposte: 400 codice errato (con `attemptsLeft`) o scaduto, 429 bloccato (con `retryAfterSeconds`).
+> Senza provider email (`SMTP_*` / `RESEND_API_KEY`) il codice viene stampato nella console del backend (mai in `NODE_ENV=production`).
+
 
 **Pagina**: `/register/verify-email`
 
@@ -167,6 +231,12 @@ Questo documento descrive il flusso di **Registrazione** e **Login** per l'appli
 
 ### 2.5 Step 5 - Frontend: Inserimento Numero Telefono (Facoltativo ma Consigliato)
 
+> **Stato implementazione:** ❌ **non implementato.** Non esistono `/register/phone-verification`, `send-otp-sms`, `verify-phone-otp`.
+> `backend/src/services/smsService.js` sa inviare SMS via Twilio (variabili `TWILIO_*`, con fallback su console) ma **nessuna rotta lo chiama**;
+> la tabella `phone_verifications` e le colonne `users.phone_verified`/`phone_verified_at` non vengono mai scritte. Il telefono inserito in
+> registrazione o nel profilo è solo salvato (colonna `users.phone_number`, univoca).
+
+
 **Pagina**: `/register/phone-verification`
 
 **Flusso**:
@@ -198,6 +268,11 @@ Questo documento descrive il flusso di **Registrazione** e **Login** per l'appli
 ---
 
 ### 2.6 Step 6 - Frontend: Riepilogo e Conferma
+
+> **Stato implementazione:** ❌ non esistono `/register/confirmation` né `register-finalize`; non viene inviata nessuna email di benvenuto.
+> L'utente viene creato (con `email_verified = false`) già al submit del form di registrazione e, dopo la pagina di verifica email, va su `/dashboard`.
+> `terms_accepted`/`privacy_accepted` sono impostati a `true` dal backend senza una scelta esplicita dell'utente: da sistemare prima di un lancio pubblico.
+
 
 **Pagina**: `/register/confirmation`
 
@@ -258,6 +333,16 @@ Questo documento descrive il flusso di **Registrazione** e **Login** per l'appli
 ---
 
 ### 3.2 Backend: Verifica Credenziali
+
+> **Stato implementazione:** ⚠️ differenze rispetto ai punti sotto:
+> - la verifica email **non** blocca il login (punto 4): l'utente entra e vede un avviso; se `REQUIRE_VERIFIED_EMAIL=true` sono bloccate solo le scritture sui dati;
+> - messaggio unico `Invalid credentials` (401) per email inesistente e password errata; 403 per account disattivato o sospeso;
+> - access token **15 minuti**; la riga in `sessions` contiene lo **SHA-256 del refresh token** (non dell'access JWT), `device_name` (User-Agent, 255 caratteri) e `ip_address`;
+>   `device_type`/`browser` non sono compilati;
+> - il login elimina le sessioni scadute dell'utente e quelle ruotate da più di 7 giorni;
+> - nessun contatore `failed_attempts` e nessun lockout per account: protegge solo `loginLimiter` (5 tentativi falliti ogni 15 minuti per IP);
+> - la risposta JSON è `{ status: "success", data: { user } }`: **nessun token nel body**, solo cookie HttpOnly.
+
 
 **Endpoint**: `POST /api/auth/login`
 
@@ -320,6 +405,11 @@ Questo documento descrive il flusso di **Registrazione** e **Login** per l'appli
 
 ### 3.3 Frontend: Salvataggio Token e Redirect
 
+> **Stato implementazione:** ✅ i token sono solo nei cookie `HttpOnly` (`SameSite=Strict`, `Secure` in produzione); il frontend non li legge mai.
+> In `localStorage` (chiave `flywallets-auth`, Zustand `persist`) finisce solo l'oggetto utente per l'interfaccia. Il redirect è sempre `/dashboard`
+> (non esiste `/onboarding`).
+
+
 **Azioni Frontend**:
 
 1. **Salva Access Token**:
@@ -380,6 +470,17 @@ Backend Flow al Login:
 ```
 
 ### 4.3 Reset Password
+
+> **Stato implementazione:** ⚠️ implementato in `authController.forgotPassword` / `resetPassword`:
+> - `POST /api/auth/forgot-password {email}` risponde **sempre** 200 con un messaggio generico (nessuna enumerazione degli account); se l'utente esiste e
+>   è attivo genera `crypto.randomBytes(32).toString("hex")`, cancella i reset pendenti, salva lo **SHA-256** in `password_resets.reset_token` (scadenza 1 ora),
+>   scrive l'audit `forgot_password` e invia il link `${CLIENT_URL}/reset-password?token=...` (primo valore di `CLIENT_URL`; in sviluppo senza SMTP il link è nella console);
+> - **non esiste** `GET /api/auth/validate-reset-token`: il frontend invia direttamente `POST /api/auth/reset-password {token, password}`; il token deve essere esadecimale di 64 caratteri;
+> - il reset usa `SELECT ... FOR UPDATE` (due richieste con lo stesso token non possono riuscire entrambe), aggiorna `password_hash`/`password_salt`/`password_changed_at`,
+>   marca `is_used`, **elimina tutte le sessioni** dell'utente e scrive l'audit `reset_password` (non `password_reset`);
+> - non viene inviata l'email di conferma "password cambiata";
+> - rate limit: 3 richieste ogni 10 minuti per email normalizzata (gli alias `a.b+x@gmail.com` condividono il contatore) e 20 ogni 10 minuti per IP.
+
 
 **Pagina**: `/forgot-password`
 
@@ -447,6 +548,10 @@ Backend Flow al Login:
 
 ### 5.1 Generazione OTP
 
+> **Stato implementazione:** ⚠️ il codice è generato lato server con `crypto.randomInt` (`generateOtp` in `utils/security.js`, 6 cifre con zeri iniziali).
+> La parte con Redis/Python sotto è solo un esempio della specifica: **Redis non è usato** (vedi 5.3).
+
+
 **Chi la fa**: Backend (server-side), DURANTE il flusso di registrazione/login
 
 **Come**:
@@ -470,6 +575,11 @@ send_email(email, f"Il tuo codice OTP è: {otp}")
 ```
 
 ### 5.2 Verifica OTP
+
+> **Stato implementazione:** ⚠️ vedi 2.4 per endpoint, payload e risposte reali. Differenza chiave rispetto alla specifica: il confronto avviene con
+> `email_verifications.code_hash` (HMAC) e l'incremento di `attempts` è fatto **prima** del confronto con un `UPDATE ... WHERE attempts < max_attempts`
+> atomico, così 40 tentativi paralleli non possono superare i 3 consentiti (test `regression.test.js`). L'audit è `verify_email` (non `email_verified`).
+
 
 **Endpoint Backend**: `POST /api/auth/verify-email-otp`
 
@@ -500,6 +610,11 @@ Frontend:
 ```
 
 ### 5.3 Storage OTP - IMPORTANTE
+
+> **Stato implementazione:** ⚠️ **scelta attuale: database, ma solo hash.** Il codice in chiaro non viene mai salvato: `code_hash = HMAC-SHA256(JWT_SECRET, "<user_id>:<codice>")`
+> (`hashOtp`), confrontato con `timingSafeEqual`. Un dump del DB da solo non permette di ricavare i codici e non serve un'infrastruttura aggiuntiva (Redis/Memcached).
+> Lo svantaggio rispetto a Redis è che le righe scadute restano in tabella finché non vengono sostituite da un nuovo invio. Redis resta un'opzione futura, non pianificata.
+
 
 **Dove NON salvare OTP**:
 - ❌ Database (chiaro)
@@ -538,6 +653,10 @@ Frontend:
 
 ### 6.1 JWT Token Structure
 
+> **Stato implementazione:** ⚠️ payload reale: access token `{ id, email, user_type, iat, exp }` (scadenza **15 minuti**, firmato con `JWT_SECRET`);
+> refresh token `{ id, jti, iat, exp }` (30 giorni, firmato con `JWT_REFRESH_SECRET`; il `jti` casuale rende unico ogni token). Il claim `sub` non è usato.
+
+
 **Access Token** (1 ora):
 ```json
 {
@@ -572,6 +691,17 @@ Frontend:
 
 ### 6.3 Refresh Token Flow
 
+> **Stato implementazione:** ✅ esteso con **rotazione e rilevamento del riuso** (`authController.refreshToken`, migrazione `database/migrations/002_session_rotation.sql`):
+> 1. `POST /api/auth/refresh-token` legge il cookie `refresh_token`, verifica la firma e blocca la riga di `sessions` (`FOR UPDATE`).
+> 2. Sessione valida e mai ruotata: la riga viene marcata `rotated_at = NOW()`, ne viene creata una nuova con **nuovo refresh token** e stessa scadenza della originale
+>    (la rotazione non allunga i 30 giorni), e vengono reimpostati entrambi i cookie.
+> 3. Token già ruotato presentato entro **30 secondi** (race tra più tab): riceve solo un nuovo access token.
+> 4. Token già ruotato presentato **dopo** i 30 secondi: considerato rubato; vengono cancellate **tutte** le sessioni dell'utente, i cookie vengono rimossi, audit `refresh_token_reuse`
+>    e risposta `403 { code: "REFRESH_TOKEN_REUSED" }`. Il frontend esegue il logout locale e rimanda a `/login`.
+> 5. Utente disattivato/sospeso o sessione inesistente/scaduta: `403 Session invalid`; cookie assente: `401`.
+> Il logout (`POST /api/auth/logout`) cancella la sessione corrispondente al cookie e ripulisce i cookie.
+
+
 **Quando Access Token scade**:
 
 ```
@@ -603,6 +733,10 @@ Frontend:
 ```
 
 ### 7.3 CSRF Protection
+
+> **Stato implementazione:** ⚠️ implementato solo `SameSite=Strict` (+ CORS con allow-list e `credentials`). Non ci sono token CSRF né controllo dell'header `Origin`
+> oltre al CORS. Conseguenza operativa: frontend e API devono stare sullo **stesso site** (stesso dominio registrabile), altrimenti i cookie non vengono inviati.
+
 ```
 ✅ SameSite cookie (Strict)
 ✅ CSRF token per form submission
@@ -610,6 +744,20 @@ Frontend:
 ```
 
 ### 7.4 Rate Limiting
+
+> **Stato implementazione:** ✅ in `backend/src/middleware/rateLimitMiddleware.js` (disattivati con `NODE_ENV=test`, contatori in memoria del processo):
+>
+> | Limiter | Limite | Chiave |
+> |---------|--------|--------|
+> | `loginLimiter` | 5 login **falliti** / 15 min | IP |
+> | `registerLimiter` | 3 / ora | IP |
+> | `otpLimiter` (reinvio OTP, forgot-password) | 3 / 10 min | utente autenticato, altrimenti email normalizzata (non l'IP) |
+> | `authCodeIpLimiter` (verify-email, forgot, reset, resend) | 20 / 10 min | IP |
+> | `apiLimiter` (tutte le rotte dati autenticate + `PUT /auth/profile`) | 120 / min | utente |
+> | `aiLimiter` (`/api/ai/*`) | 10 / min | utente |
+>
+> Con un reverse proxy impostare `TRUST_PROXY` per vedere l'IP reale.
+
 ```
 ✅ Login: max 5 tentativi in 15 minuti
 ✅ Registrazione: max 3 account dalla stessa IP in 1 ora
@@ -618,6 +766,11 @@ Frontend:
 ```
 
 ### 7.5 Password Security
+
+> **Stato implementazione:** ⚠️ bcrypt a 12 round ✅; regole backend: minimo 8 caratteri, 1 maiuscola, 1 numero, 1 carattere in `@$!%*?&`. Il misuratore di robustezza è nel frontend
+> (`PasswordStrength`, `lib/passwordStrength.js`). ❌ Nessun controllo contro password comuni né sul fatto che la password contenga l'email. Non esiste un endpoint per cambiare password da loggati
+> (solo il flusso di reset via email).
+
 ```
 ✅ bcrypt con rounds=12
 ✅ Min 8 caratteri, 1 maiusc, 1 numero, 1 speciale
@@ -633,6 +786,10 @@ Frontend:
 ```
 
 ### 7.7 Device Management
+
+> **Stato implementazione:** ❌ non implementato. Le sessioni vengono salvate (`sessions`: `device_name`, `ip_address`), ma non c'è un endpoint/UI per elencarle o per il logout remoto,
+> né "Ricorda questo device", né 2FA, né email per nuovo login.
+
 ```
 ✅ Memorizza device info in sessions
 ✅ Consenti "Ricorda questo device" (opzionale 2FA)
@@ -643,6 +800,9 @@ Frontend:
 ---
 
 ## 8. DIAGRAMMA FLUSSO REGISTRAZIONE
+
+> **Stato implementazione:** il diagramma descrive la **specifica a 6 step**. Nel codice i passi 1-3 e 6 sono un'unica `POST /api/auth/register` (con sessione e cookie già creati), il passo 4 è la pagina `/register/verify-email` e il passo 5 (telefono) non esiste. Vedi la sezione 1bis.
+
 
 ```
 START
@@ -696,6 +856,9 @@ END (Account Attivo)
 ---
 
 ## 9. DIAGRAMMA FLUSSO LOGIN
+
+> **Stato implementazione:** differenze rispetto al diagramma: nessun lockout per account (solo rate limit per IP), nessun blocco per email non verificata, access token da 15 minuti, token solo nei cookie (non nel JSON). Vedi la sezione 1bis e 3.2.
+
 
 ```
 START (User su /login page)
@@ -782,6 +945,12 @@ def get_transaction(transaction_id):
 
 ### 10.2 Multi-User Concorrenza
 
+> **Stato implementazione:** ⚠️ pool PostgreSQL (`pg.Pool`) ✅; **Redis ❌ non usato**. L'isolamento è implementato con **due pool**: `DATABASE_URL` (owner, flussi di autenticazione, seed, scheduler)
+> e `DATABASE_APP_URL` (ruolo `flywallets_app`, soggetto a RLS) usato da ogni richiesta dati tramite `req.withUser(fn)` → `BEGIN` + `set_config('app.current_user_id', ...)` + query + `COMMIT`.
+> Le operazioni sul saldo prendono il lock di riga del conto (`SELECT ... FOR UPDATE`), non servono livelli `SERIALIZABLE`. Se `DATABASE_APP_URL` non è impostata le policy RLS esistono ma
+> **non sono applicate** (superuser/owner le bypassano): vedi `database/rls_app_role.sql` e il README principale.
+
+
 **Problema**: 100 utenti si loggano simultaneamente
 
 **Soluzione**:
@@ -849,6 +1018,9 @@ T=50ms  User1 authorized                  User2 authorized
 
 ## 11. TABELLA MAPPING REGISTRAZIONE
 
+> **Stato implementazione:** la mappatura campo → colonna è corretta, ma gli "step" sono tutti eseguiti dalla stessa `POST /api/auth/register`. Le righe 5 (telefono verificato / `phone_verifications`) e `marketing_consent` non sono popolate dal flusso attuale: il telefono viene salvato in `users.phone_number` senza verifica, e `terms_accepted`/`privacy_accepted` sono impostati dal backend.
+
+
 | Step | Campo Frontend | Tabella Database | Colonna |
 |------|----------------|--------------------|---------|
 | 1 | Email | users | email |
@@ -887,6 +1059,13 @@ T=50ms  User1 authorized                  User2 authorized
 ---
 
 ## 12. CHECKLIST SICUREZZA
+
+> **Stato implementazione (spunte aggiornate al codice):** [x] CORS senza wildcard · [x] bcrypt 12 round · [x] rate limiting login/registrazione/OTP/API · [x] timeout sessione 15 min access / 30 giorni refresh ·
+> [x] reset password con token monouso · [x] RLS abilitato (efficace solo con `DATABASE_APP_URL`) · [x] query parametrizzate · [x] audit log per le azioni di auth principali ·
+> [ ] OTP in Redis (scelta diversa: hash in DB) · [ ] HTTPS/HSTS gestiti dal deployment (Helmet imposta l'header HSTS, ma il TLS va configurato davanti all'app) · [ ] CSP del frontend ·
+> [ ] token CSRF (solo SameSite) · [ ] 2FA · [ ] gestione dispositivi · [ ] email "nuovo login" · [ ] email obbligatoriamente verificata per usare l'app (opzionale con `REQUIRE_VERIFIED_EMAIL`) ·
+> [ ] backup automatici (responsabilità del deployment).
+
 
 Prima di andare in produzione:
 

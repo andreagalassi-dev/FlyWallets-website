@@ -12,6 +12,60 @@ Questo documento non è una semplice checklist di sicurezza. È una **architettu
 
 ---
 
+## 0. STATO DI IMPLEMENTAZIONE (aggiornato al codice)
+
+> **Come leggere questo documento.** Il resto del file è una **architettura di sicurezza di riferimento (target)** per un prodotto fintech in produzione: molte parti riguardano infrastruttura
+> (WAF, DDoS, mTLS, VPN, SIEM, Secrets Manager) e processi (incident response, compliance) che **non fanno parte di questo repository**. Questa sezione dice cosa è davvero nel codice di FlyWallets.
+> Legenda: ✅ implementato e coperto dal codice (spesso dai test in `backend/tests`), ⚠️ parziale o con condizioni, ❌ non implementato.
+
+### 0.1 Applicazione (backend `backend/src`, frontend `frontend/src`)
+
+| Controllo | Stato | Dettaglio / dove |
+|-----------|:-----:|------------------|
+| Hash password | ✅ | bcrypt 12 round (`utils/security.js`); policy: 8+ caratteri, 1 maiuscola, 1 numero, 1 di `@$!%*?&` (`validationMiddleware.js`) |
+| Sessioni e token | ✅ | Access JWT 15 min + refresh JWT 30 giorni in cookie `HttpOnly`, `SameSite=Strict`, `Secure` in produzione; il frontend non vede i token |
+| Refresh token | ✅ | Salvato solo come SHA-256 in `sessions`; **rotazione a ogni refresh** con rilevamento del riuso (finestra di grazia di 30 s; oltre, revoca di tutte le sessioni, audit `refresh_token_reuse`, codice `REFRESH_TOKEN_REUSED`) |
+| OTP email | ✅ | 6 cifre da CSPRNG, salvato come HMAC-SHA256 legato all'utente, TTL 10 min, 3 tentativi riservati atomicamente in SQL, blocco 15 min |
+| Reset password | ✅ | Token da 256 bit, solo SHA-256 nel DB, 1 ora, monouso (`FOR UPDATE`), revoca di tutte le sessioni; risposta identica per email inesistenti (nessuna enumerazione) |
+| Rate limiting | ✅ | `rateLimitMiddleware.js`: login 5 falliti/15 min/IP, registrazione 3/h/IP, OTP/reset 3/10 min per utente o email normalizzata, verify/forgot/reset 20/10 min/IP, API 120/min/utente, AI 10/min/utente. ⚠️ contatori in memoria di processo (non condivisi tra istanze, azzerati al riavvio) |
+| Lockout per account | ❌ | Solo limite per IP |
+| Validazione input | ✅ | `express-validator` su ogni endpoint di scrittura (tipi, lunghezze, UUID, importi positivi con max 2 decimali, date ISO); limite body 100 kB (2 MB solo per l'import CSV, dopo l'autenticazione) |
+| SQL injection | ✅ | Solo query parametrizzate (`pg`, `$1…`); i filtri `LIKE` fanno escape di `%`, `_`, `\` |
+| Autorizzazione / isolamento tra utenti | ✅ | Filtri `WHERE user_id = $1` su ogni query, risorse altrui → 404, `FOR UPDATE` sui conti; test di isolamento in `ledger.test.js`, `budgets.test.js`, `recurring.test.js` |
+| RLS PostgreSQL | ⚠️ | Policy su tutte le tabelle utente e contesto `app.current_user_id` per richiesta. **Applicate solo se si usa il ruolo `flywallets_app` (`DATABASE_APP_URL`)**: superuser/owner le bypassano (`ENABLE`, non `FORCE`). Default e stack Docker: **non applicate** |
+| RBAC / ruoli admin | ❌ | Non esistono ruoli: solo `user_type` (`individual`/`business`) e proprietà dei dati. Nessuna area admin |
+| CORS | ✅ | Allow-list da `CLIENT_URL` con `credentials`; origini sconosciute → 403 |
+| Header di sicurezza | ⚠️ | `helmet()` sulle risposte dell'API (include HSTS e una CSP restrittiva per l'API). Il frontend Next.js **non imposta una propria CSP** |
+| CSRF | ⚠️ | Solo `SameSite=Strict` (nessun token CSRF) → richiede frontend e API sullo stesso site |
+| XSS | ⚠️ | React esegue l'escape di default e il frontend non usa mai `dangerouslySetInnerHTML`; manca però una CSP sul frontend |
+| Errori | ✅ | Gestore globale: nessun stack/dettaglio interno al client (500 generico) |
+| Segreti | ✅ | `JWT_SECRET`/`JWT_REFRESH_SECRET` solo da ambiente (>= 32 caratteri; in produzione il server non parte senza); in sviluppo secret casuale per processo; `.env*` ignorati da git tranne `.env.example`; il compose richiede i secret |
+| CSV (import/export) | ✅ | Neutralizzazione della formula injection in export (`= + - @ TAB CR`), limiti 1 MB / 2.000 righe, parsing senza dipendenze, righe isolate da SAVEPOINT |
+| AI | ✅ | Al provider vanno solo descrizione/importo o totali per categoria; l'output è validato contro le categorie reali dell'utente (difesa da prompt injection), timeout 8 s, fallback deterministico, limiter dedicato |
+| Audit logging | ⚠️ | `audit_logs` scritto per register, login, forgot/reset password, verifica email, riuso refresh token, import CSV. Non loggati: login falliti, logout, reinvio OTP, modifiche ai dati. Nessuna lettura via API |
+| Cifratura dei campi sensibili | ❌ | Nessuna routine di cifratura applicativa. Le colonne `bank_accounts.*_encrypted` e `users.two_factor_secret_encrypted` esistono ma non sono usate (nessuna integrazione bancaria, nessuna 2FA) |
+| 2FA / MFA | ❌ | Non implementata |
+| Gestione dispositivi, email "nuovo login", logout remoto | ❌ | Le sessioni sono salvate ma non esposte |
+| Controllo password comuni / compromesse | ❌ | Non presente |
+| Consenso (termini, privacy, marketing) | ⚠️ | `terms_accepted`/`privacy_accepted` impostati a `true` dal backend alla registrazione, senza checkbox nel form: da rendere esplicito prima di un lancio pubblico |
+| Verifica email obbligatoria | ⚠️ | Opzionale (`REQUIRE_VERIFIED_EMAIL=true`): blocca le scritture (403 `EMAIL_NOT_VERIFIED`), non il login |
+| Diritti GDPR (export completo, cancellazione account) | ❌ | Esiste solo l'export CSV delle transazioni; nessun endpoint di cancellazione account o export completo dei dati |
+| PSD2 / Open Banking | ❌ | Nessuna integrazione con provider (vedi README, sezione Roadmap) |
+
+### 0.2 Repository, build e infrastruttura fornita
+
+| Controllo | Stato | Dettaglio |
+|-----------|:-----:|-----------|
+| CI | ✅ | `.github/workflows/ci.yml`: lint + test backend con PostgreSQL 16 (ruolo RLS incluso), lint + test + build frontend, build Docker |
+| Dipendenze | ⚠️ | Dependabot settimanale (npm backend/frontend, GitHub Actions). Nessun `npm audit`/SCA, SAST o DAST nella CI |
+| Immagini Docker | ⚠️ | Backend e frontend eseguiti come utente `node` (non root) con healthcheck; PostgreSQL pubblicato solo su `127.0.0.1`. Lo stack compose gira con `NODE_ENV=development` e connessione `postgres` superuser: è pensato per prove locali, non per la produzione |
+| TLS / WAF / DDoS / mTLS / VPN / backup | ❌ | Fuori dal repository: responsabilità del deployment. Con un reverse proxy impostare `TRUST_PROXY`. La connessione al DB gestito usa SSL con `rejectUnauthorized: false` (il certificato del server non viene verificato) |
+| Monitoraggio centralizzato, SIEM, alert, incident response | ❌ | Solo log su console (`morgan` fuori dai test); nessuna integrazione |
+| Gestione segreti (Secrets Manager, rotazione chiavi) | ❌ | Variabili d'ambiente; nessuna rotazione automatica |
+| Segnalazione vulnerabilità | ✅ | `SECURITY.md` (GitHub security advisories) |
+
+---
+
 ## 1. CONTESTO: Perché la Sicurezza È Critica per FlyWallets
 
 ### 1.1 Natura Sensibile dei Dati
@@ -338,6 +392,9 @@ RENDER SETUP:
 
 #### 6.1.1 Password Storage - NON NEGOTIABLE
 
+> **Stato implementazione:** ✅ `bcrypt` a 12 round in `utils/security.js`. Nota: la colonna `users.password_salt` è NOT NULL e riceve il salt generato da `bcrypt.genSalt` (già incorporato in `password_hash`); è ridondante ma innocua.
+
+
 ```javascript
 // ❌ ASSOLUTAMENTE VIETATO
 const password = req.body.password;  // Mai in chiaro
@@ -371,6 +428,9 @@ Migliore: Rounds=12 balance tra security e user experience.
 ```
 
 #### 6.1.2 Multi-Factor Authentication (2FA/MFA)
+
+> **Stato implementazione:** ❌ **non implementata.** Le colonne `users.two_factor_enabled/method/secret_encrypted` esistono nello schema ma nessun codice le usa. Il resto della sezione è un obiettivo futuro.
+
 
 **Obbligatorio implementare, ma opzionale per user**:
 
@@ -448,6 +508,9 @@ if (verified) {
 
 ### 6.2 Authorization - Role-Based Access Control (RBAC)
 
+> **Stato implementazione:** ⚠️ non c'è RBAC: ogni utente può accedere solo ai propri dati (controllo di proprietà su ogni query + RLS con `DATABASE_APP_URL`; risorse di altri utenti restituiscono 404). Non esistono ruoli admin/operatore.
+
+
 ```javascript
 // ❌ SBAGLIATO
 app.get('/api/users/:user_id/data', (req, res) => {
@@ -488,6 +551,9 @@ USING (user_id = current_user_id());
 ```
 
 ### 6.3 Input Validation - CRITICAL
+
+> **Stato implementazione:** ✅ validatori per ogni endpoint in `backend/src/middleware/validationMiddleware.js` (+ validatori locali in `routes/importExportRoutes.js`). I controller leggono solo i campi attesi dal body (niente mass assignment, p.es. `is_admin` non esiste). Errori di validazione → 400 con `errors[]`.
+
 
 ```javascript
 // ❌ SBAGLIATO: Trust user input
@@ -533,6 +599,9 @@ app.post('/api/users',
 
 ### 6.4 SQL Injection Prevention
 
+> **Stato implementazione:** ✅ tutte le query usano parametri posizionali; gli unici frammenti SQL dinamici sono nomi di colonna/tabella scelti dal codice (non dall'input) e il costrutto `LIMIT/OFFSET` costruito da interi già validati e convertiti (`toInt`).
+
+
 ```javascript
 // ❌ VULNERABILE: String concatenation
 const email = req.body.email;
@@ -552,6 +621,9 @@ db.query(query, [email]);  // Email treated as literal value
 ```
 
 ### 6.5 CSRF Protection
+
+> **Stato implementazione:** ⚠️ implementata solo la difesa primaria `SameSite=Strict` sui cookie `access_token`/`refresh_token` (insieme alla allow-list CORS). **Non c'è un token CSRF** e non ci sono sessioni lato server con `req.session`: l'esempio sotto è illustrativo. Conseguenza: frontend e API devono condividere lo stesso site.
+
 
 ```javascript
 // ✅ SameSite Cookie (primary defense)
@@ -581,6 +653,9 @@ app.post('/register', (req, res) => {
 
 ### 6.6 XSS Prevention
 
+> **Stato implementazione:** ⚠️ React esegue l'escape; il backend è una API JSON (`helmet()` attivo). Il frontend **non imposta una Content-Security-Policy** (`frontend/next.config.ts` non definisce header): è un lavoro aperto.
+
+
 ```javascript
 // ❌ VULNERABILE: Unsafe HTML rendering
 const userComment = req.body.comment;
@@ -606,6 +681,9 @@ app.use((req, res, next) => {
 
 ### 6.7 Token Security
 
+> **Stato implementazione:** ✅ cookie `HttpOnly` + `SameSite=Strict` (+ `Secure` in produzione), access token **15 minuti** (non 1 ora), refresh token 30 giorni **ruotato** a ogni uso. In `localStorage` c'è solo il profilo utente per la UI (`flywallets-auth`), mai i token.
+
+
 ```javascript
 // JWT Token Storage (Frontend)
 
@@ -626,6 +704,9 @@ res.cookie('access_token', jwtToken, {
 ```
 
 ### 6.8 Rate Limiting
+
+> **Stato implementazione:** ✅ vedi la tabella in 0.1 e `backend/src/middleware/rateLimitMiddleware.js`. I valori reali differiscono dall'esempio (API: 120/min per utente; non esiste whitelist IP). Disattivato solo con `NODE_ENV=test`. Store in memoria: per più istanze serve uno store condiviso (es. Redis), non ancora previsto.
+
 
 ```javascript
 const rateLimit = require('express-rate-limit');
@@ -667,6 +748,9 @@ app.use('/api/', apiLimiter);
 ## 7. LAYER 4: DATA SECURITY
 
 ### 7.1 Encryption at Rest
+
+> **Stato implementazione:** ❌ nessuna cifratura applicativa dei campi nel DB (nessuna `encryptField`). Le colonne previste per i token bancari e il secret 2FA sono inutilizzate. Cifratura a riposo del volume/disco e dei backup è responsabilità del deployment.
+
 
 ```javascript
 // Campi che DEVONO essere criptati nel DB:
@@ -748,6 +832,9 @@ Tutti i dati in movimento:
 ## 8. LAYER 5: MONITORING & INCIDENT RESPONSE
 
 ### 8.1 Logging Strategy
+
+> **Stato implementazione:** ⚠️ vedi "Audit logging" in 0.1. Esiste la tabella `audit_logs` (user, action, IP, user agent, dettagli JSON) scritta con il pool owner; il log HTTP è `morgan('dev')` su console. Non c'è log centralizzato né alerting.
+
 
 ```
 COSA LOGGARE (Security-critical events):
@@ -951,6 +1038,9 @@ POST-INCIDENT (24-48 hours):
 
 ### 9.1 GDPR Compliance
 
+> **Stato implementazione:** ⚠️ i dati sono per utente con cancellazione a cascata nel DB (`ON DELETE CASCADE`), ma **non esistono** endpoint per cancellare l'account o esportare tutti i dati (solo CSV delle transazioni), né gestione esplicita del consenso (vedi 0.1).
+
+
 ```
 GDPR Requirements for FlyWallets:
 
@@ -992,6 +1082,9 @@ GDPR Requirements for FlyWallets:
 
 ### 9.2 PSD2 Compliance
 
+> **Stato implementazione:** ❌ non applicabile finché non esiste un'integrazione Open Banking (nessun provider, `bank_accounts` mai popolata).
+
+
 ```
 PSD2 Requirements for Open Banking Integration:
 
@@ -1025,6 +1118,9 @@ PSD2 Requirements for Open Banking Integration:
 ## 10. VULNERABILITY SCANNING & TESTING
 
 ### 10.1 Static Analysis (SAST)
+
+> **Stato implementazione:** ⚠️ nella CI girano solo ESLint (backend e frontend) e i test; non sono configurati SAST dedicati, DAST, `npm audit` o scansione delle immagini. Dependabot è attivo.
+
 
 ```
 Tools:
@@ -1092,6 +1188,10 @@ Maintenance:
 ```
 
 ### 11.2 How to Store Secrets - CORRECT WAY
+
+> **Stato implementazione:** ⚠️ i segreti si leggono da variabili d'ambiente (`config/env.js`): in produzione il server termina se `JWT_SECRET`/`JWT_REFRESH_SECRET` mancano o hanno meno di 32 caratteri; non c'è nessun valore di default hardcoded. `docker-compose.yml` rifiuta di partire senza i due secret.
+> Non c'è integrazione con un Secrets Manager. Se un file `.env.*` con credenziali (es. un vecchio `.env.render-old`) è presente in locale, assicurarsi che sia ignorato da git ed eliminarlo; le password eventualmente esposte in passato vanno ruotate.
+
 
 ```
 ❌ SBAGLIATO
@@ -1264,6 +1364,9 @@ Low Incidents (RTO/RTC: 7 days)
 ---
 
 ## 15. SECURITY CHECKLIST - PRE-PRODUCTION
+
+> **Stato implementazione:** la checklist sotto è la lista **target**. Per sapere quali voci sono già coperte dal codice vedere le tabelle 0.1 e 0.2 (es.: bcrypt 12 round ✅, query parametrizzate ✅, validazione input ✅, rate limiting ✅, HTTPS/HSTS/WAF/DDoS/VPC/backup ❌ fuori dal repository, 2FA ❌, cifratura campi ❌, diritti GDPR ❌, SIEM ❌).
+
 
 ```
 INFRASTRUCTURE

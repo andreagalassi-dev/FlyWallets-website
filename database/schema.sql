@@ -1,23 +1,5 @@
--- CLEANUP (Reset Database)
--- We wrap this in a transaction to ensure all-or-nothing execution
-
-
-DROP TABLE IF EXISTS sessions CASCADE;
-DROP TABLE IF EXISTS password_resets CASCADE;
-DROP TABLE IF EXISTS phone_verifications CASCADE;
-DROP TABLE IF EXISTS email_verifications CASCADE;
-DROP TABLE IF EXISTS audit_logs CASCADE;
-DROP TABLE IF EXISTS savings_goal_transactions CASCADE;
-DROP TABLE IF EXISTS savings_goal_accounts CASCADE;
-DROP TABLE IF EXISTS savings_goals CASCADE;
-DROP TABLE IF EXISTS account_balances CASCADE;
-DROP TABLE IF EXISTS transactions CASCADE;
-DROP TABLE IF EXISTS manual_accounts CASCADE;
-DROP TABLE IF EXISTS bank_accounts CASCADE;
-DROP TABLE IF EXISTS transaction_categories CASCADE;
-DROP TABLE IF EXISTS user_businesses CASCADE;
-DROP TABLE IF EXISTS user_individuals CASCADE;
-DROP TABLE IF EXISTS users CASCADE;
+-- FlyWallets database schema.
+-- Safe by default: it never drops anything. To wipe everything first, run database/reset.sql.
 
 -- Enable UUID extension (pgcrypto is standard for gen_random_uuid)
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
@@ -37,7 +19,7 @@ BEGIN
     -- This relies on the application setting 'app.current_user_id' within the transaction
     RETURN NULLIF(current_setting('app.current_user_id', true), '')::uuid;
 END;
-$$ LANGUAGE plpgsql SECURITY DEFINER;
+$$ LANGUAGE plpgsql STABLE SET search_path = pg_catalog;
 
 
 -- =============================================
@@ -269,6 +251,7 @@ CREATE INDEX idx_transactions_bank_account_id ON transactions(bank_account_id);
 CREATE INDEX idx_transactions_transaction_date ON transactions(transaction_date);
 CREATE INDEX idx_transactions_transaction_type ON transactions(transaction_type);
 CREATE INDEX idx_transactions_category_id ON transactions(category_id);
+CREATE INDEX idx_transactions_user_date_id ON transactions(user_id, transaction_date DESC, id DESC);
 
 CREATE TRIGGER update_transactions_updated_at BEFORE UPDATE ON transactions FOR EACH ROW EXECUTE PROCEDURE update_updated_at_column();
 
@@ -290,6 +273,11 @@ CREATE TABLE account_balances (
 
 CREATE INDEX idx_account_balances_user_id ON account_balances(user_id);
 CREATE INDEX idx_account_balances_balance_date ON account_balances(balance_date);
+
+-- One snapshot per account per day. The table-level UNIQUE above cannot enforce this
+-- because one of the two account columns is always NULL (NULLs are distinct in UNIQUE).
+CREATE UNIQUE INDEX uq_account_balances_manual_day ON account_balances(manual_account_id, balance_date) WHERE manual_account_id IS NOT NULL;
+CREATE UNIQUE INDEX uq_account_balances_bank_day ON account_balances(bank_account_id, balance_date) WHERE bank_account_id IS NOT NULL;
 
 -- =============================================
 -- 9. SAVINGS_GOALS
@@ -371,6 +359,7 @@ CREATE TABLE email_verifications (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     email TEXT NOT NULL,
+    code_hash TEXT,
     is_verified BOOLEAN DEFAULT false,
     verified_at TIMESTAMP,
     attempts INTEGER DEFAULT 0,
@@ -428,10 +417,17 @@ CREATE TABLE sessions (
     browser TEXT,
     ip_address TEXT,
     created_at TIMESTAMP DEFAULT NOW(),
-    expires_at TIMESTAMP NOT NULL
+    expires_at TIMESTAMP NOT NULL,
+    -- Set when the refresh token was exchanged for a new one (rotation). Presenting a rotated token after
+    -- the short grace window is treated as token theft: every session of the user is revoked.
+    rotated_at TIMESTAMP,
+    -- All the refresh tokens of one login (the rotation chain) share a family: logout deletes the whole family,
+    -- and a rotated token is only honoured in the grace window while its family still has a live head.
+    family_id UUID NOT NULL DEFAULT gen_random_uuid()
 );
 
 CREATE INDEX idx_sessions_user_id ON sessions(user_id);
+CREATE INDEX idx_sessions_family_id ON sessions(family_id);
 CREATE INDEX idx_sessions_session_token ON sessions(session_token);
 CREATE INDEX idx_sessions_expires_at ON sessions(expires_at);
 
@@ -496,8 +492,16 @@ CREATE POLICY manual_accounts_isolation ON manual_accounts
     FOR ALL USING (user_id = current_user_id());
 
 -- 7. TRANSACTIONS
+-- WITH CHECK also verifies that the referenced account belongs to the same user (FK checks bypass RLS,
+-- so without this a user could attach a transaction to somebody else's account id).
 CREATE POLICY transactions_isolation ON transactions
-    FOR ALL USING (user_id = current_user_id());
+    FOR ALL USING (user_id = current_user_id())
+    WITH CHECK (
+        user_id = current_user_id()
+        AND (manual_account_id IS NULL OR EXISTS (SELECT 1 FROM manual_accounts m WHERE m.id = manual_account_id AND m.user_id = current_user_id()))
+        AND (bank_account_id IS NULL OR EXISTS (SELECT 1 FROM bank_accounts b WHERE b.id = bank_account_id AND b.user_id = current_user_id()))
+        AND (transactions.category_id IS NULL OR EXISTS (SELECT 1 FROM transaction_categories c WHERE c.id = transactions.category_id AND (c.is_system = true OR c.user_id = current_user_id())))
+    );
 
 -- 8. ACCOUNT_BALANCES
 CREATE POLICY account_balances_isolation ON account_balances
@@ -520,13 +524,19 @@ CREATE POLICY savings_goal_accounts_modification ON savings_goal_accounts
 
 -- 11. SAVINGS_GOAL_TRANSACTIONS
 CREATE POLICY savings_goal_transactions_isolation ON savings_goal_transactions
-    FOR SELECT USING (
+    FOR ALL USING (
         EXISTS (SELECT 1 FROM savings_goals WHERE id = savings_goal_transactions.savings_goal_id AND user_id = current_user_id())
+    )
+    WITH CHECK (
+        EXISTS (SELECT 1 FROM savings_goals WHERE id = savings_goal_transactions.savings_goal_id AND user_id = current_user_id())
+        AND EXISTS (SELECT 1 FROM transactions t WHERE t.id = savings_goal_transactions.transaction_id AND t.user_id = current_user_id())
     );
 
 -- 12. AUDIT_LOGS (Users can see their own logs)
 CREATE POLICY audit_logs_isolation ON audit_logs
     FOR SELECT USING (user_id = current_user_id());
+CREATE POLICY audit_logs_insert ON audit_logs
+    FOR INSERT WITH CHECK (user_id = current_user_id());
 
 -- 13. EMAIL_VERIFICATIONS
 CREATE POLICY email_verifications_isolation ON email_verifications
@@ -543,6 +553,71 @@ CREATE POLICY password_resets_isolation ON password_resets
 -- 16. SESSIONS
 CREATE POLICY sessions_isolation ON sessions
     FOR ALL USING (user_id = current_user_id());
+
+
+-- =============================================
+-- 17. BUDGETS (monthly spending limit per category)
+-- =============================================
+CREATE TABLE budgets (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    category_id UUID NOT NULL REFERENCES transaction_categories(id) ON DELETE CASCADE,
+    monthly_limit NUMERIC(18,2) NOT NULL CHECK (monthly_limit > 0),
+    alert_threshold INTEGER NOT NULL DEFAULT 80 CHECK (alert_threshold BETWEEN 1 AND 100),
+    is_active BOOLEAN DEFAULT true,
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW(),
+    UNIQUE(user_id, category_id)
+);
+
+CREATE INDEX idx_budgets_user_id ON budgets(user_id);
+
+CREATE TRIGGER update_budgets_updated_at BEFORE UPDATE ON budgets FOR EACH ROW EXECUTE PROCEDURE update_updated_at_column();
+
+-- =============================================
+-- 18. RECURRING_TRANSACTIONS (rent, subscriptions, salary...)
+-- =============================================
+CREATE TABLE recurring_transactions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    manual_account_id UUID NOT NULL REFERENCES manual_accounts(id) ON DELETE CASCADE,
+    category_id UUID REFERENCES transaction_categories(id) ON DELETE SET NULL,
+    amount NUMERIC(18,2) NOT NULL CHECK (amount > 0),
+    transaction_type TEXT NOT NULL CHECK (transaction_type IN ('income', 'expense')),
+    description TEXT NOT NULL,
+    frequency TEXT NOT NULL CHECK (frequency IN ('daily', 'weekly', 'monthly', 'yearly')),
+    start_date DATE NOT NULL,
+    next_run_date DATE NOT NULL,
+    end_date DATE,
+    is_active BOOLEAN DEFAULT true,
+    last_run_at TIMESTAMP,
+    last_error TEXT,
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX idx_recurring_user_id ON recurring_transactions(user_id);
+CREATE INDEX idx_recurring_next_run ON recurring_transactions(next_run_date) WHERE is_active = true;
+
+CREATE TRIGGER update_recurring_updated_at BEFORE UPDATE ON recurring_transactions FOR EACH ROW EXECUTE PROCEDURE update_updated_at_column();
+
+ALTER TABLE budgets ENABLE ROW LEVEL SECURITY;
+ALTER TABLE recurring_transactions ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY budgets_isolation ON budgets
+    FOR ALL USING (user_id = current_user_id())
+    WITH CHECK (
+        user_id = current_user_id()
+        AND EXISTS (SELECT 1 FROM transaction_categories c WHERE c.id = category_id AND (c.is_system = true OR c.user_id = current_user_id()))
+    );
+
+CREATE POLICY recurring_isolation ON recurring_transactions
+    FOR ALL USING (user_id = current_user_id())
+    WITH CHECK (
+        user_id = current_user_id()
+        AND EXISTS (SELECT 1 FROM manual_accounts m WHERE m.id = manual_account_id AND m.user_id = current_user_id())
+        AND (recurring_transactions.category_id IS NULL OR EXISTS (SELECT 1 FROM transaction_categories c WHERE c.id = recurring_transactions.category_id AND (c.is_system = true OR c.user_id = current_user_id())))
+    );
 
 
 -- =============================================

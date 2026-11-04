@@ -274,7 +274,7 @@ test("export: stalled readers hold no DB connection, are capped per user and dro
   const acc = await newAccount(u, 0);
   await pool.query(
     `INSERT INTO transactions (user_id, manual_account_id, transaction_date, amount, transaction_type, description, notes)
-     SELECT $1, $2, NOW() - (g || ' minutes')::interval, 1, 'income', 'Descrizione abbastanza lunga ' || g, repeat('n', 60)
+     SELECT $1, $2, NOW() - (g || ' minutes')::interval, 1, 'income', 'Descrizione abbastanza lunga ' || g, repeat('n', 600)
        FROM generate_series(1, 50000) g`,
     [u.userId, acc]
   );
@@ -295,8 +295,10 @@ test("export: stalled readers hold no DB connection, are capped per user and dro
     const busyMs = await accountsLatency(); // while the 10 exports are still filling their socket buffers
     assert.ok(busyMs < 4000, `GET /api/accounts during 10 active exports: ${busyMs.toFixed(0)} ms`);
 
-    // Once the socket buffers are full the exports wait for 'drain' WITHOUT any DB connection
-    const deadline = Date.now() + 15000;
+    // Once the socket buffers are full the exports wait for 'drain' WITHOUT any DB connection.
+    // The rows are ~700 bytes (50,000 of them = ~35 MB) so the kernel buffers fill quickly even on Linux, where
+    // they autotune to several MB; the generous deadline covers slow, shared CI runners.
+    const deadline = Date.now() + 90000;
     while (appPool.totalCount - appPool.idleCount > 0 && Date.now() < deadline) await sleep(100);
     assert.equal(appPool.totalCount - appPool.idleCount, 0, "every RLS connection is back in the pool");
     const { rows } = await pool.query(

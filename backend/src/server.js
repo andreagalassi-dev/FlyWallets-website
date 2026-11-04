@@ -1,45 +1,15 @@
-const express = require("express");
-const cors = require("cors");
-const helmet = require("helmet");
-const morgan = require("morgan");
-const cookieParser = require("cookie-parser");
-require("dotenv").config();
-
+const app = require("./app");
 const { connectDB } = require("./config/db");
+const { PORT } = require("./config/env");
 
-const app = express();
-
-// Middleware
-app.use(helmet());
-app.use(cors({ origin: "http://localhost:3000", credentials: true })); // Updated for FrontEnd
-app.use(express.json());
-app.use(cookieParser());
-app.use(morgan("dev"));
-
-// Database Connection
 connectDB();
 
-// Routes
-app.use("/api/auth", require("./routes/authRoutes"));
-
-app.get("/api/health", (req, res) => {
-  res
-    .status(200)
-    .json({ status: "OK", message: "FlyWallets Backend is Running 🚀" });
-});
-
-app.get("/", (req, res) => {
-  res.send("FlyWallets API v1.0");
-});
-
-// Error Handling
-app.use((err, req, res, next) => {
-  console.error(err.stack);
-  res.status(500).json({ status: "error", message: "Internal Server Error" });
-});
-
-// Server Start
-const PORT = process.env.PORT || 5000;
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Server running on port ${PORT}`);
 });
+
+// Recurring transactions: generate due occurrences for all users at startup, then every hour.
+// Lives here (not in app.js) so tests never start timers. Disable with RECURRING_SCHEDULER=off.
+if (process.env.RECURRING_SCHEDULER !== "off") {
+  require("./services/recurringService").startScheduler();
+}

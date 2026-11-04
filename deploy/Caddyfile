@@ -1,0 +1,55 @@
+# FlyWallets production reverse proxy: ONE domain, automatic HTTPS.
+#   /api/*      -> backend:5000   (Express API)
+#   everything  -> frontend:3000  (Next.js)
+# The browser therefore talks to the API on the same origin, which the SameSite=Strict auth cookies require.
+#
+# DOMAIN      public host name (A/AAAA record pointing at this server), e.g. wallet.example.com
+# TLS_DIRECTIVE  empty for real domains (Let's Encrypt / ZeroSSL, automatic). The compose file sets it to
+#             "tls internal" only when TLS_INTERNAL=true (LOCAL TESTING ONLY: Caddy then signs with its own private
+#             CA and browsers/curl show a certificate warning).
+
+{$DOMAIN:localhost} {
+	{$TLS_DIRECTIVE:}
+
+	encode zstd gzip
+
+	# Access log as JSON on stdout (docker compose logs caddy). Cookie and Authorization headers are redacted.
+	log {
+		output stdout
+		format json
+	}
+
+	header {
+		# HSTS: browsers refuse plain HTTP for this host for one year. No "preload"/"includeSubDomains" on purpose.
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		# Only added when the upstream did not set its own value (the API sends helmet's headers).
+		?Referrer-Policy "strict-origin-when-cross-origin"
+		?X-Frame-Options "SAMEORIGIN"
+		?Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=()"
+		-Server
+		-X-Powered-By
+		# No Content-Security-Policy here: Next.js needs inline scripts, a restrictive CSP would break the app.
+	}
+
+	# API. Caddy sets X-Forwarded-For/-Proto/-Host itself and DISCARDS any X-Forwarded-For sent by the client
+	# (no trusted_proxies configured), so the backend (TRUST_PROXY=1) sees the real client address.
+	handle /api/* {
+		# The CSV import accepts 2 MB; the API enforces its own, stricter limits per route.
+		request_body {
+			max_size 3MB
+		}
+		reverse_proxy backend:5000 {
+			# No passive health checks (fail_duration) on purpose: with a single upstream one aborted request would
+			# make Caddy answer 503 to everybody for the whole fail window.
+			transport http {
+				dial_timeout 5s
+				response_header_timeout 60s
+			}
+		}
+	}
+
+	handle {
+		reverse_proxy frontend:3000
+	}
+}

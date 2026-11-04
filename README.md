@@ -200,7 +200,7 @@ Things to know about the Docker stack:
 
 - `schema.sql` is mounted into the postgres image and runs **only on the first start of an empty volume**. To start from scratch: `docker compose down -v`.
 - `NEXT_PUBLIC_API_URL` is inlined into the browser bundle **at build time** (compose passes `http://localhost:${BACKEND_PORT}/api` as a build argument). After changing `BACKEND_PORT` run `docker compose up --build` again. The API must be reachable from the **browser**, not only from the container network.
-- The backend container runs with `NODE_ENV=development` on purpose (plain HTTP on localhost: production mode needs HTTPS for the `Secure` cookies and refuses the seed script). Use a TLS reverse proxy and `NODE_ENV=production` for a real deployment.
+- The backend container runs with `NODE_ENV=development` on purpose (plain HTTP on localhost: production mode needs HTTPS for the `Secure` cookies and refuses the seed script). For a real deployment use the production setup in [`deploy/README.md`](deploy/README.md) (Caddy with automatic HTTPS, `NODE_ENV=production`).
 - Compose forwards only a subset of the backend variables (see the Docker Compose table under [Environment variables](#environment-variables)). In particular `REQUIRE_VERIFIED_EMAIL`, `TRUST_PROXY`, `RECURRING_SCHEDULER`, `GEMINI_MODEL` and `OPENAI_MODEL` are **not** forwarded: add them to the `backend.environment` block of `docker-compose.yml` if you need them. Row-Level Security **is** enforced in the Docker stack: on the first start of an empty volume `database/docker/02_rls_app_role.sh` creates the restricted `flywallets_app` role (password `APP_DB_PASSWORD`, alphanumeric, dev default `flywallets_app`) and the backend uses it through `DATABASE_APP_URL`. If your volume was created before this existed, run `docker compose down -v` (this deletes the data) or create the role by hand as described in [RLS](#row-level-security-rls).
 - Without e-mail credentials, verification codes and reset links are printed in `docker compose logs backend`.
 
@@ -556,11 +556,24 @@ npm run build
 |---|---|
 | Backend (lint + tests) | `postgres:16-alpine` service, loads `schema.sql`, creates the RLS role (`rls_app_role.sql`), then `npm run lint` and `npm test` with `TEST_DATABASE_URL` and `TEST_DATABASE_APP_URL`. |
 | Frontend (lint + tests + build) | `npm ci`, `npm run lint`, `npm test`, `npm run build`. |
-| Docker (compose build) | `docker compose build` with placeholder secrets (nothing is started). |
+| Docker (compose build) | `docker compose build` with placeholder secrets (nothing is started), then validates `deploy/docker-compose.prod.yml` with `docker compose config`. |
 
 ---
 
 ## Deployment notes
+
+### Production with Docker (recommended)
+
+[`deploy/README.md`](deploy/README.md) is the complete guide. In short:
+
+- One server with Docker, one domain pointing at it, ports 80/443 open. Caddy terminates HTTPS (automatic certificates) and routes `/api/*` to the API and everything else to the web app, so both are served from the **same site** as the `SameSite=Strict` cookies require.
+- `cp deploy/production.env.example deploy/.env`, set `DOMAIN` and generate the four secrets (JWT secrets and database passwords), then `docker compose -f deploy/docker-compose.prod.yml --env-file deploy/.env up -d --build`.
+- The API runs with `NODE_ENV=production`, `TRUST_PROXY=1` and the restricted RLS role; PostgreSQL and the API are not published to the host and no demo data is loaded.
+- Backups (`pg_dump`), updates, migrations, secret rotation and the limits of this setup (no monitoring, single instance, in-memory rate limits) are covered in `deploy/README.md`.
+
+### Manual / PaaS deployment
+
+The notes below apply if you do not use the Docker setup above.
 
 - Set `NODE_ENV=production`: cookies get the `Secure` flag (HTTPS required) and the server refuses to start without strong secrets.
 - Provide `JWT_SECRET` and `JWT_REFRESH_SECRET` (>= 32 random characters, different from each other):

@@ -123,3 +123,7 @@ jobs:
           # Placeholders only so compose can interpolate; nothing is started and nothing is baked into the images.
           JWT_SECRET: ci-build-only-placeholder-not-a-secret-0123456789
           JWT_REFRESH_SECRET: ci-build-only-placeholder-not-a-secret-9876543210
+
+      - name: Validate production compose file
+        # Interpolation and syntax check only, using the fake placeholders of the example env file
+        run: docker compose -f deploy/docker-compose.prod.yml --env-file deploy/production.env.example config -q

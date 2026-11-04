@@ -1,5 +1,27 @@
 # Schema Database - Definizione Testuale Completa
 
+> **Nota sullo stato del documento.** Descrive lo schema di `database/schema.sql` (PostgreSQL 16), aggiornato al codice: **18 tabelle** (le 16 originali + `budgets` e `recurring_transactions`).
+> Il file SQL è la fonte di verità; questo documento ne è la versione leggibile. Le colonne/tabelle presenti nello schema ma **non usate dal codice** sono segnate con ❌ "predisposta, non usata".
+> Per i database già esistenti vedere `database/migrations/` (solo `001_budgets_recurring.sql` e `002_session_rotation.sql`; nessuna migrazione per `code_hash`, indici univoci degli snapshot e policy RLS aggiornate: in sviluppo ricreare il database).
+
+### Stato d'uso delle tabelle
+
+| Tabella | Usata dal codice | Note |
+|---------|:----------------:|------|
+| `users`, `user_individuals`, `user_businesses` | ✅ | Registrazione, login, profilo (`authController`) |
+| `transaction_categories` | ✅ | 25 categorie di sistema nel seed di `schema.sql` + categorie utente |
+| `manual_accounts` | ✅ | Conti manuali, scoperto (`overdraft_allowed`, `overdraft_limit`), archiviazione |
+| `transactions` | ✅ | Ledger; `bank_account_id` esiste ma nessun codice crea transazioni bancarie |
+| `account_balances` | ✅ | Snapshot giornalieri ricostruiti da `ledgerService` (non da un job notturno) |
+| `savings_goals`, `savings_goal_transactions` | ✅ | Obiettivi e contributi |
+| `budgets` | ✅ | Limite mensile per categoria (tabella 17) |
+| `recurring_transactions` | ✅ | Regole ricorrenti + scheduler (tabella 18) |
+| `audit_logs` | ✅ (solo scrittura) | Nessun endpoint di lettura |
+| `email_verifications`, `password_resets`, `sessions` | ✅ | OTP email, reset password, refresh token |
+| `bank_accounts` | ❌ | Predisposta per Open Banking: nessuna integrazione provider, nessun codice la popola |
+| `phone_verifications` | ❌ | Nessun endpoint la usa (la verifica SMS non è implementata) |
+| `savings_goal_accounts` | ❌ | Nessun codice la usa |
+
 ## 1. TABELLA: users
 
 **Descrizione**: Informazioni base di tutti gli utenti (persone fisiche e aziende)
@@ -35,6 +57,10 @@
 | updated_at | TIMESTAMP | DEFAULT NOW | Data ultimo aggiornamento |
 | last_login_at | TIMESTAMP | NULLABLE | Ultimo accesso |
 | profile_public | BOOLEAN | DEFAULT false | Profilo pubblico? |
+
+**Stato d'uso**: ✅ `email`, `email_verified(_at)`, `password_*`, `user_type`, `is_active`, `is_suspended`, `last_login_at`, `terms_*`/`privacy_*` (impostati a `true` dal backend alla registrazione), `phone_number` (solo salvato).
+❌ Non usate: `phone_verified(_at)`, `two_factor_*` (nessuna 2FA), `stripe_customer_id`, `subscription_plan`, `subscription_expires_at`, `marketing_consent`, `suspension_reason` (non letta né scritta dal codice; il login controlla solo `is_suspended`), `profile_public`.
+`password_salt` contiene il salt generato da bcrypt (è già incorporato in `password_hash`; la colonna è ridondante ma NOT NULL).
 
 ---
 
@@ -144,6 +170,9 @@
 | updated_at | TIMESTAMP | DEFAULT NOW | Data aggiornamento |
 | UNIQUE(user_id, provider_account_id) | - | Un utente non può sincronizzare lo stesso conto due volte | - |
 
+**Stato**: ❌ **tabella predisposta, non popolata da nessun codice.** Non esiste un'integrazione con provider Open Banking (Plaid/Tink/Fabrick). `GET /api/accounts`, i filtri delle transazioni, l'export CSV e i budget sanno leggere
+righe di questa tabella, ma oggi non ne esistono. Le colonne dei token cifrati non hanno alcuna routine di cifratura (vedi sezione sicurezza in fondo).
+
 ---
 
 ## 6. TABELLA: manual_accounts
@@ -168,6 +197,10 @@
 | is_archived | BOOLEAN | DEFAULT false | Conto archiviato? |
 | created_at | TIMESTAMP | DEFAULT NOW | Data creazione |
 | updated_at | TIMESTAMP | DEFAULT NOW | Data aggiornamento |
+
+**Regole applicative**: `current_balance` è modificato solo dal ledger (transazioni, contributi obiettivo, ricorrenze, import CSV) con `SELECT ... FOR UPDATE` sulla riga. Il saldo non può scendere sotto `0` se `overdraft_allowed = false`,
+né sotto `-overdraft_limit` se il limite è valorizzato (`overdraft_limit NULL` con `overdraft_allowed = true` = scoperto illimitato); violazioni → 422 `INSUFFICIENT_FUNDS` / `OVERDRAFT_LIMIT_CONFLICT`.
+Un conto con transazioni viene archiviato (`is_archived = true`, `is_active = false`) invece di essere eliminato. `account_currency` vale `EUR`: non c'è selezione valuta.
 
 ---
 
@@ -200,6 +233,10 @@
 | updated_at | TIMESTAMP | DEFAULT NOW | Data aggiornamento |
 | CHECK | - | (manual_account_id NOT NULL AND bank_account_id NULL) OR (manual_account_id NULL AND bank_account_id NOT NULL) | Una transazione appartiene a un solo conto |
 
+**Regole applicative**: l'API accetta date fino a 1 giorno nel futuro e fino a 10 anni nel passato; `amount` > 0 con al massimo 2 decimali. `transaction_date` è `TIMESTAMP` senza fuso: tutto il sistema lavora in **UTC** (sessione `timezone=UTC`).
+Le colonne `transaction_time`, `provider_transaction_id`, `merchant_name`, `reference`, `is_auto_imported`, `import_source`, `attachment_url` ❌ non sono usate (predisposte per l'import bancario). Le transazioni generate dalle regole ricorrenti hanno il tag `recurring`.
+Le transazioni con `bank_account_id` non sono modificabili/eliminabili dall'API (400).
+
 ---
 
 ## 8. TABELLA: account_balances
@@ -217,7 +254,12 @@
 | currency | TEXT | DEFAULT 'EUR' | Valuta |
 | is_manual | BOOLEAN | DEFAULT false | Calcolato manualmente? |
 | last_updated_at | TIMESTAMP | DEFAULT NOW | Ultimo aggiornamento |
-| UNIQUE(user_id, manual_account_id, bank_account_id, balance_date) | - | Un solo snapshot per conto per data | - |
+| UNIQUE(user_id, manual_account_id, bank_account_id, balance_date) | - | Vincolo di tabella (non sufficiente da solo: una delle due colonne conto è sempre NULL e i NULL sono distinti) | - |
+
+**Indici univoci parziali** (aggiunti per garantire davvero uno snapshot per conto e per giorno, usati da `INSERT ... ON CONFLICT` in `ledgerService.rebuildSnapshots`):
+`uq_account_balances_manual_day ON (manual_account_id, balance_date) WHERE manual_account_id IS NOT NULL` e `uq_account_balances_bank_day ON (bank_account_id, balance_date) WHERE bank_account_id IS NOT NULL`.
+**Come si popola**: non c'è un job notturno. A ogni creazione/modifica/eliminazione di transazione (anche retrodatata) il ledger ricostruisce gli snapshot dalla data più antica toccata fino a oggi
+(`saldo(giorno) = initial_balance + somma firmata delle transazioni fino a quel giorno`). Alimentano `GET /api/accounts/:id/history` e il grafico Net worth.
 
 ---
 
@@ -297,25 +339,27 @@
 
 ## 13. TABELLA: email_verifications
 
-**Descrizione**: Gestione verifica email (OTP NON MEMORIZZATI - solo stato)
+**Descrizione**: Gestione verifica email (OTP): contiene **l'hash** del codice, mai il codice in chiaro
 
 | Colonna | Tipo | Regole | Descrizione |
 |---------|------|--------|-------------|
 | id | UUID | PRIMARY KEY, NOT NULL, AUTO | Identificatore univoco |
 | user_id | UUID | FOREIGN KEY → users.id, NOT NULL, INDEX, ON DELETE CASCADE | Utente |
 | email | TEXT | NOT NULL | Email da verificare |
+| code_hash | TEXT | NULLABLE | HMAC-SHA256 (chiave `JWT_SECRET`) di `"<user_id>:<codice>"`; il codice a 6 cifre non è mai salvato |
 | is_verified | BOOLEAN | DEFAULT false | Verificata? |
 | verified_at | TIMESTAMP | NULLABLE | Data/ora verifica |
 | attempts | INTEGER | DEFAULT 0 | Numero tentativi OTP |
 | max_attempts | INTEGER | DEFAULT 3 | Massimo tentativi consentiti |
-| locked_until | TIMESTAMP | NULLABLE | Bloccata fino a quando (anti-brute-force) |
+| locked_until | TIMESTAMP | NULLABLE | Bloccata fino a quando (anti-brute-force, +15 minuti al raggiungimento di `max_attempts`) |
 | created_at | TIMESTAMP | DEFAULT NOW | Data creazione |
-| expires_at | TIMESTAMP | NOT NULL | Scadenza richiesta verifica (es. 24 ore) |
+| expires_at | TIMESTAMP | NOT NULL | Scadenza del codice (10 minuti dalla generazione) |
 
-**IMPORTANTE**: 
-- L'OTP viene generato in memoria, inviato via email, e NON viene salvato nel database
-- Ogni tentativo di verifica controlla l'OTP fornito direttamente (senza leggere dal DB)
-- Solo il flag "is_verified" e il contatore "attempts" sono memorizzati
+**IMPORTANTE (stato attuale del codice)**:
+- L'OTP è generato lato server (`crypto.randomInt`), inviato via email e salvato **solo come HMAC** in `code_hash`. Redis/cache non sono usati.
+- Un nuovo invio cancella le righe non verificate dell'utente e ne crea una nuova.
+- Il tentativo viene riservato con un `UPDATE ... WHERE attempts < max_attempts` atomico **prima** del confronto, quindi richieste parallele non possono superare `max_attempts`.
+- Le righe scadute non vengono pulite da un job: restano finché non sono sostituite da un nuovo invio.
 
 ---
 
@@ -336,10 +380,7 @@
 | created_at | TIMESTAMP | DEFAULT NOW | Data creazione |
 | expires_at | TIMESTAMP | NOT NULL | Scadenza richiesta verifica (es. 24 ore) |
 
-**IMPORTANTE**: 
-- L'OTP viene generato in memoria, inviato via SMS, e NON viene salvato nel database
-- Ogni tentativo di verifica controlla l'OTP fornito direttamente (senza leggere dal DB)
-- Solo il flag "is_verified" e il contatore "attempts" sono memorizzati
+**Stato**: ❌ **tabella predisposta ma non usata.** La verifica del telefono via SMS non è implementata (`smsService.js` non è chiamato da nessun endpoint). Il design previsto era: OTP generato lato server, inviato via SMS e confrontato senza salvarlo in chiaro (stessa logica di `email_verifications`, che oggi salva un hash in `code_hash`; per questa tabella servirebbe una colonna analoga).
 
 ---
 
@@ -355,31 +396,102 @@
 | is_used | BOOLEAN | DEFAULT false | Token usato? |
 | used_at | TIMESTAMP | NULLABLE | Data/ora uso |
 | created_at | TIMESTAMP | DEFAULT NOW | Data creazione |
-| expires_at | TIMESTAMP | NOT NULL | Scadenza token (es. 1 ora) |
+| expires_at | TIMESTAMP | NOT NULL | Scadenza token (1 ora) |
+
+**Stato attuale**: `reset_token` contiene lo **SHA-256** del token casuale a 256 bit (`crypto.randomBytes(32)` in esadecimale, 64 caratteri) inviato nel link email; il token in chiaro non è salvato. Una nuova richiesta cancella i reset non usati dell'utente; il reset è monouso (`is_used`, `used_at`) ed elimina tutte le righe di `sessions` dell'utente.
 
 ---
 
 ## 16. TABELLA: sessions
 
-**Descrizione**: Gestione sessioni utente attive
+**Descrizione**: Gestione sessioni utente attive (una riga per ogni refresh token emesso)
 
 | Colonna | Tipo | Regole | Descrizione |
 |---------|------|--------|-------------|
 | id | UUID | PRIMARY KEY, NOT NULL, AUTO | Identificatore univoco |
 | user_id | UUID | FOREIGN KEY → users.id, NOT NULL, INDEX, ON DELETE CASCADE | Utente |
-| session_token | TEXT | UNIQUE, NOT NULL, INDEX | Token sessione (hashato) |
-| device_name | TEXT | NULLABLE | Nome dispositivo |
-| device_type | TEXT | NULLABLE | Tipo: 'mobile', 'desktop', 'tablet' |
-| browser | TEXT | NULLABLE | Browser utilizzato |
-| ip_address | TEXT | NULLABLE | Indirizzo IP |
+| session_token | TEXT | UNIQUE, NOT NULL, INDEX | **SHA-256 del refresh token** (il token in chiaro è solo nel cookie `refresh_token`) |
+| device_name | TEXT | NULLABLE | User-Agent (troncato a 255 caratteri) |
+| device_type | TEXT | NULLABLE | ❌ non popolata |
+| browser | TEXT | NULLABLE | ❌ non popolata |
+| ip_address | TEXT | NULLABLE | Indirizzo IP della richiesta |
 | created_at | TIMESTAMP | DEFAULT NOW | Data creazione sessione |
-| expires_at | TIMESTAMP | NOT NULL, INDEX | Scadenza sessione |
+| expires_at | TIMESTAMP | NOT NULL, INDEX | Scadenza sessione (30 giorni dal login; la rotazione eredita la scadenza originale) |
+| rotated_at | TIMESTAMP | NULLABLE | Valorizzata quando il refresh token è stato scambiato con uno nuovo (rotazione). Aggiunta dalla migrazione `002_session_rotation.sql` |
+
+**Rotazione e rilevamento del riuso**: a ogni `POST /api/auth/refresh-token` la riga corrente riceve `rotated_at = NOW()` e ne viene inserita una nuova. Un token già ruotato presentato entro 30 secondi
+(race tra più tab) ottiene solo un nuovo access token; oltre i 30 secondi il riuso è considerato furto: **tutte** le sessioni dell'utente vengono cancellate (audit `refresh_token_reuse`).
+Il login elimina le sessioni scadute dell'utente e quelle ruotate da più di 7 giorni.
+
+---
+
+## 17. TABELLA: budgets
+
+**Descrizione**: Limite di spesa mensile per categoria (un budget per utente e categoria). Il "speso" non è salvato: è calcolato a ogni lettura sulle spese del mese corrente (UTC).
+
+| Colonna | Tipo | Regole | Descrizione |
+|---------|------|--------|-------------|
+| id | UUID | PRIMARY KEY, NOT NULL, AUTO | Identificatore univoco |
+| user_id | UUID | FOREIGN KEY → users.id, NOT NULL, INDEX, ON DELETE CASCADE | Proprietario |
+| category_id | UUID | FOREIGN KEY → transaction_categories.id, NOT NULL, ON DELETE CASCADE | Categoria (solo `expense` o `both`, verificato dall'API) |
+| monthly_limit | NUMERIC(18,2) | NOT NULL, CHECK > 0 | Limite mensile |
+| alert_threshold | INTEGER | NOT NULL, DEFAULT 80, CHECK BETWEEN 1 AND 100 | Percentuale oltre la quale lo stato diventa `warning` |
+| is_active | BOOLEAN | DEFAULT true | Budget attivo? (solo gli attivi entrano nei totali e negli avvisi) |
+| created_at | TIMESTAMP | DEFAULT NOW | Data creazione |
+| updated_at | TIMESTAMP | DEFAULT NOW | Data aggiornamento (trigger) |
+| UNIQUE(user_id, category_id) | - | Un solo budget per categoria | - |
+
+Stato calcolato dall'API: `ok`, `warning` (speso ≥ soglia % del limite) o `exceeded` (speso ≥ limite). Migrazione per DB esistenti: `001_budgets_recurring.sql`.
+
+---
+
+## 18. TABELLA: recurring_transactions
+
+**Descrizione**: Regole di transazioni ricorrenti (affitto, abbonamenti, stipendio) su **conti manuali**. Le occorrenze dovute diventano transazioni vere tramite il ledger.
+
+| Colonna | Tipo | Regole | Descrizione |
+|---------|------|--------|-------------|
+| id | UUID | PRIMARY KEY, NOT NULL, AUTO | Identificatore univoco |
+| user_id | UUID | FOREIGN KEY → users.id, NOT NULL, INDEX, ON DELETE CASCADE | Proprietario |
+| manual_account_id | UUID | FOREIGN KEY → manual_accounts.id, NOT NULL, ON DELETE CASCADE | Conto su cui generare le transazioni |
+| category_id | UUID | FOREIGN KEY → transaction_categories.id, NULLABLE, ON DELETE SET NULL | Categoria |
+| amount | NUMERIC(18,2) | NOT NULL, CHECK > 0 | Importo |
+| transaction_type | TEXT | NOT NULL, CHECK IN ('income', 'expense') | Entrata o uscita |
+| description | TEXT | NOT NULL | Descrizione |
+| frequency | TEXT | NOT NULL, CHECK IN ('daily', 'weekly', 'monthly', 'yearly') | Frequenza |
+| start_date | DATE | NOT NULL | Data di ancoraggio (giorno del mese mantenuto, con riduzione a fine mese: 31 gen → 28/29 feb → 31 mar) |
+| next_run_date | DATE | NOT NULL, INDEX parziale (solo regole attive) | Prima occorrenza non ancora generata |
+| end_date | DATE | NULLABLE | Ultima data; superata, la regola viene disattivata |
+| is_active | BOOLEAN | DEFAULT true | Regola attiva? (pausa/ripresa) |
+| last_run_at | TIMESTAMP | NULLABLE | Ultima generazione riuscita |
+| last_error | TEXT | NULLABLE | Ultimo errore (es. fondi insufficienti): l'occorrenza fallita viene ritentata al giro successivo |
+| created_at | TIMESTAMP | DEFAULT NOW | Data creazione |
+| updated_at | TIMESTAMP | DEFAULT NOW | Data aggiornamento (trigger) |
+
+Elaborazione (`services/recurringService.js`): le regole dovute (`next_run_date <= oggi UTC`) sono reclamate con `FOR UPDATE SKIP LOCKED`, ogni occorrenza gira in un SAVEPOINT e passa da `ledgerService.recordTransaction`
+(quindi rispetta scoperto e snapshot). Max 366 occorrenze per regola per esecuzione. Eseguita: allo startup e ogni ora da uno scheduler nel processo API (`RECURRING_SCHEDULER=off` lo disabilita),
+in modo pigro su `GET /api/recurring`, alla creazione/modifica di una regola e su `POST /api/recurring/process`. Migrazione per DB esistenti: `001_budgets_recurring.sql`.
+
+---
+
+## ROW-LEVEL SECURITY (RLS)
+
+- `schema.sql` abilita RLS (`ENABLE ROW LEVEL SECURITY`, **non** `FORCE`) su tutte le tabelle utente, incluse `budgets` e `recurring_transactions`, con policy basate su `current_user_id()`
+  (legge `current_setting('app.current_user_id', true)`; funzione `STABLE` con `search_path = pg_catalog`).
+- Il backend usa **due pool**: `DATABASE_URL` (owner/superuser: registrazione, login, sessioni, OTP, reset, scritture di audit, scoperta utenti dello scheduler, seed) e `DATABASE_APP_URL`
+  (ruolo `flywallets_app`, creato da `database/rls_app_role.sql`) per tutte le rotte dati, ognuna dentro una transazione con `set_config('app.current_user_id', <uuid>, true)`.
+- Il ruolo `flywallets_app` è `NOSUPERUSER NOBYPASSRLS` e ha: `SELECT/INSERT/UPDATE/DELETE` su categorie, conti, transazioni, snapshot, obiettivi (+ tabelle ponte), `budgets`, `recurring_transactions`;
+  solo `SELECT` su `users`, `user_individuals`, `user_businesses`, `audit_logs`; **nessun accesso** a `sessions`, `email_verifications`, `phone_verifications`, `password_resets`.
+- **Caveat onesto**: superuser e proprietari delle tabelle bypassano RLS. Se `DATABASE_APP_URL` non è impostata (default, anche nello stack Docker) le policy esistono ma non sono applicate e l'isolamento
+  dipende dai filtri `WHERE user_id = $1` dell'API. Dopo `001_budgets_recurring.sql` su un DB che ha già il ruolo, rieseguire `rls_app_role.sql` per concedere i permessi sulle nuove tabelle.
+- Policy rilevanti: `transactions_isolation` verifica anche (WITH CHECK) che il conto referenziato appartenga all'utente (le FK bypassano RLS); `savings_goal_transactions_isolation` verifica obiettivo e transazione;
+  `budgets_isolation` verifica che la categoria sia di sistema o dell'utente; `recurring_isolation` verifica il conto; `audit_logs` ha `SELECT` e `INSERT` per il proprio `user_id`.
 
 ---
 
 ## RIEPILOGO CATEGORIE PREDEFINITE (transaction_categories)
 
-Le seguenti categorie verranno create di sistema (is_system = true):
+Le seguenti **25** categorie (7 entrate + 18 spese) vengono inserite da `schema.sql` come categorie di sistema (is_system = true, user_id NULL). Le descrizioni e i colori sono nel file SQL. Il motore di categorizzazione a parole chiave (`services/aiService.js`) fa riferimento a questi nomi:
 
 ### INCOME (Entrate):
 - 💼 Stipendio
@@ -406,7 +518,6 @@ Le seguenti categorie verranno create di sistema (is_system = true):
 - 🎁 Regali
 - 💳 Pagamenti Carte
 - 🏦 Commissioni Bancarie
-- 📊 Investimenti
 - 🧹 Pulizia & Manutenzione
 - 🎮 Giochi & Divertimento
 - 💐 Varie
@@ -465,6 +576,14 @@ sessions.user_id
 sessions.session_token
 sessions.expires_at
 
+budgets.user_id
+
+recurring_transactions.user_id
+recurring_transactions.next_run_date   (parziale: WHERE is_active = true)
+
+account_balances (manual_account_id, balance_date)  UNIQUE parziale WHERE manual_account_id IS NOT NULL
+account_balances (bank_account_id, balance_date)    UNIQUE parziale WHERE bank_account_id IS NOT NULL
+
 audit_logs.user_id
 audit_logs.action
 audit_logs.created_at
@@ -480,31 +599,37 @@ audit_logs.created_at
 4. **Unicità Codice Fiscale**: Una persona fisica non può avere due codici fiscali
 5. **Unicità Partita IVA**: Un'azienda non può avere due P.IVA
 6. **Transazione Single Account**: Una transazione deve appartenere a UN SOLO conto (manuale O bancario)
-7. **Balance Date Univoco**: Un conto non può avere due snapshot di saldo per lo stesso giorno
-8. **Goal Account Univoco**: Uno specifico conto non può essere assegnato due volte allo stesso goal
+7. **Balance Date Univoco**: Un conto non può avere due snapshot di saldo per lo stesso giorno (garantito dagli indici univoci parziali `uq_account_balances_*_day`)
+8. **Goal Account Univoco**: Uno specifico conto non può essere assegnato due volte allo stesso goal (tabella `savings_goal_accounts` oggi non usata dal codice)
+9. **Budget Univoco**: un solo budget per (utente, categoria); `monthly_limit > 0`; `alert_threshold` tra 1 e 100
+10. **Ricorrenze**: `amount > 0`, `frequency` in (`daily`, `weekly`, `monthly`, `yearly`); eliminando il conto o l'utente le regole vengono eliminate, eliminando la categoria diventano senza categoria
 
 ---
 
 ## OPERAZIONI DI SISTEMA AUTOMATICHE
 
-1. **Aggiornamento saldo conto manuale**: Ogni transazione su un conto manuale aggiorna `current_balance`
-2. **Snapshot giornaliero**: System job crea entry in `account_balances` ogni notte
-3. **Aggiornamento goal progress**: Quando una transazione è assegnata a un goal, aumenta `current_amount`
-4. **Session expiry**: Session con `expires_at` passato sono considerate scadute
-5. **Token expiry check**: Access token con scadenza superata devono essere rinnovati
-6. **Password salt**: Viene rigenerato ogni volta che l'utente cambia password
-7. **Audit logging**: Ogni azione sensibile viene loggata in `audit_logs`
+1. **Aggiornamento saldo conto manuale**: ogni creazione/modifica/eliminazione di transazione aggiorna `current_balance` nella stessa transazione SQL (`ledgerService`), con controllo dello scoperto.
+2. **Snapshot giornaliero**: ✅ ricostruito dal ledger a ogni variazione (dalla data più antica toccata fino a oggi), non da un job notturno.
+3. **Aggiornamento goal progress**: contributi (`POST /api/goals/:id/contribute`) e transazioni di spesa con `savings_goal_id` aumentano `current_amount`; modifiche/eliminazioni li stornano. Il completamento è "appiccicoso" quando si aggiunge denaro.
+4. **Generazione ricorrenze**: scheduler nel processo API all'avvio e ogni ora (`RECURRING_SCHEDULER=off` per disattivarlo) + elaborazione pigra quando si usa l'API delle ricorrenze.
+5. **Session expiry**: le sessioni con `expires_at` passato non sono valide per il refresh; il login elimina quelle scadute dell'utente e quelle ruotate da più di 7 giorni.
+6. **Token expiry check**: l'access token dura 15 minuti; il frontend lo rinnova in automatico con il refresh token (che viene ruotato).
+7. **Password salt**: viene rigenerato a ogni cambio password (bcrypt, 12 round).
+8. **Audit logging**: scritto per `register`, `login`, `forgot_password`, `reset_password`, `verify_email`, `refresh_token_reuse`, `import_transactions`. Nessuna lettura via API.
+9. **`updated_at`**: aggiornato dal trigger `update_updated_at_column()` sulle tabelle che lo hanno.
 
 ---
 
 ## SICUREZZA - CAMPI CRIPTATI
 
-I seguenti campi DEVONO essere criptati (cifra/decifratura lato applicazione):
-- `users.password_hash` → Hash bcrypt (non decifrabile, solo verificabile)
-- `users.two_factor_secret_encrypted` → Secret per authenticator app
-- `bank_accounts.access_token_encrypted` → Access token API
-- `bank_accounts.refresh_token_encrypted` → Refresh token API
+Stato attuale rispetto alla specifica:
 
-I seguenti campi DEVONO usare hash one-way (non decifrare mai):
-- `sessions.session_token` → Hash SHA-256 o simile
-- `password_resets.reset_token` → Hash SHA-256 o simile
+- `users.password_hash` → ✅ hash bcrypt (non decifrabile, solo verificabile).
+- `sessions.session_token` → ✅ SHA-256 del **refresh token** (hash one-way).
+- `password_resets.reset_token` → ✅ SHA-256 del token inviato via email.
+- `email_verifications.code_hash` → ✅ HMAC-SHA256 del codice OTP, legato all'utente.
+- `users.two_factor_secret_encrypted` → ❌ colonna predisposta, 2FA non implementata.
+- `bank_accounts.access_token_encrypted` / `refresh_token_encrypted` → ❌ colonne predisposte, nessuna integrazione bancaria e **nessuna routine di cifratura implementata**: se si implementerà Open Banking
+  va aggiunta una cifratura applicativa (es. AES-GCM con chiave fuori dal DB) prima di salvare questi valori.
+
+I campi che DEVONO usare hash one-way (non decifrare mai): `sessions.session_token`, `password_resets.reset_token`, `email_verifications.code_hash`, `users.password_hash`.

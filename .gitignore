@@ -1,10 +1,26 @@
 # Dependencies
+node_modules/
 **/node_modules/
+
+# Next.js build output
+.next/
+out/
 
 # Environment variables
 .env
-.env.*
-**/*.env
+.env*.local
+.env.production
+.env.development
+**/.env
+**/.env.local
+**/.env.development
+**/.env.production
+# Allow example files
+!.env.example
+!**/.env.example
+# Any backup/variant of an env file (e.g. .env.old, .env.render-old) - only the examples are committed
+**/.env.*
+!**/.env.example
 
 # Logs and debug
 logs/
@@ -24,5 +40,6 @@ coverage/
 .vscode/
 .idea/
 *.swp
+*.swo
 .DS_Store
 Thumbs.db
